@@ -1,6 +1,7 @@
 use nom::{
+    branch::alt,
     bytes::complete::{tag, take, take_while1},
-    combinator::map_res,
+    combinator::{cut, map, map_res},
     multi::many0,
     sequence::pair,
     IResult,
@@ -12,22 +13,13 @@ use std::{collections::BTreeMap, num};
 // shouldn't happen according to the BitTorrent specification,
 // but we need a way to handle that.
 pub fn parse_bencode(bencode: &str) -> IResult<&str, Bencode> {
-    // TODO: Error propogation
-    if let Ok((bencode, output)) = number(bencode) {
-        Ok((bencode, Bencode::Number(output)))
-    } else if let Ok((bencode, output)) = string(bencode) {
-        Ok((bencode, Bencode::String(output)))
-    } else if let Ok((bencode, output)) = list(bencode) {
-        Ok((bencode, Bencode::List(output)))
-    } else if let Ok((bencode, output)) = dict(bencode) {
-        return Ok((bencode, Bencode::Dict(output)));
-    } else {
-        // TODO: Return a better error somehow
-        Err(nom::Err::Error(nom::error::Error::new(
-            bencode,
-            nom::error::ErrorKind::Alt,
-        )))
-    }
+    // TODO: return our custom error somehow
+    alt((
+        map(number, Bencode::Number),
+        map(string, Bencode::String),
+        map(list, Bencode::List),
+        map(dict, Bencode::Dict),
+    ))(bencode)
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -66,17 +58,18 @@ fn string(bencode: &str) -> IResult<&str, String> {
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| {
             s.parse::<usize>()
         })(bencode)?;
-    let (bencode, _) = tag(":")(bencode)?;
-    let (bencode, output_string) = take(num_characters)(bencode)?;
+    let (bencode, _) = cut(tag(":"))(bencode)?;
+    let (bencode, output_string) = cut(take(num_characters))(bencode)?;
 
     Ok((bencode, output_string.to_owned()))
 }
 
 fn number(bencode: &str) -> IResult<&str, i64> {
     let (bencode, _) = tag("i")(bencode)?;
-    let (bencode, output_number) = map_res(
+    let (bencode, output_number) = cut(map_res(
         take_while1(|c: char| c.is_ascii_digit() || c == '-'),
         |s: &str| {
+            // TODO: clean up this error handling
             let number = s
                 .parse()
                 .map_err(|e| BencodeNumberParsingError::ParseError { source: e })?;
@@ -100,24 +93,24 @@ fn number(bencode: &str) -> IResult<&str, i64> {
 
             Ok(number)
         },
-    )(bencode)?;
-    let (bencode, _) = tag("e")(bencode)?;
+    ))(bencode)?;
+    let (bencode, _) = cut(tag("e"))(bencode)?;
 
     Ok((bencode, output_number))
 }
 
 fn list(bencode: &str) -> IResult<&str, Vec<Bencode>> {
     let (bencode, _) = tag("l")(bencode)?;
-    let (bencode, output_list) = many0(parse_bencode)(bencode)?;
-    let (bencode, _) = tag("e")(bencode)?;
+    let (bencode, output_list) = cut(many0(parse_bencode))(bencode)?;
+    let (bencode, _) = cut(tag("e"))(bencode)?;
 
     Ok((bencode, output_list))
 }
 
 fn dict(bencode: &str) -> IResult<&str, BTreeMap<String, Bencode>> {
     let (bencode, _) = tag("d")(bencode)?;
-    let (bencode, output_tuple_list) = many0(pair(string, parse_bencode))(bencode)?;
-    let (bencode, _) = tag("e")(bencode)?;
+    let (bencode, output_tuple_list) = cut(many0(pair(string, parse_bencode)))(bencode)?;
+    let (bencode, _) = cut(tag("e"))(bencode)?;
 
     Ok((bencode, output_tuple_list.into_iter().collect()))
 }
