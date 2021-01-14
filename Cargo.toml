@@ -10,3 +10,9 @@ edition = "2018"
 nom = "6"
 snafu = "0.6"
 sha-1 = "0.9"
+url = "2.2"
+percent-encoding = "2.1"
+build-info = "0.0.21"
+
+[build-dependencies]
+build-info-build = "0.0.21"

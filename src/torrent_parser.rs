@@ -178,6 +178,12 @@ impl TryFrom<Bencode> for TorrentFile {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SHA1Hash([u8; 20]);
 
+impl AsRef<[u8; 20]> for SHA1Hash {
+    fn as_ref(&self) -> &[u8; 20] {
+        &self.0
+    }
+}
+
 impl fmt::Debug for SHA1Hash {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.0 {

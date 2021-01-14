@@ -2,9 +2,11 @@
 
 mod bencode_parser;
 mod torrent_parser;
+mod tracker;
 
 use std::{convert::TryFrom, env, fs};
 use torrent_parser::Torrent;
+use tracker::build_tracker_url;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let torrent_bytes = fs::read(
@@ -15,7 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let torrent = Torrent::try_from(torrent_bytes)?;
 
-    // dbg!(torrent);
+    let url = build_tracker_url(&torrent, "6881")?;
 
+    dbg!(url.as_str());
+    
     Ok(())
 }
