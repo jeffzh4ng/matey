@@ -85,7 +85,7 @@ pub enum BencodeNumberParsingError {
     },
 }
 
-fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
+pub fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
     let (bencode, num_characters) = map_res(take_while1(is_digit), |bytes| {
         String::from_utf8_lossy(bytes).parse::<usize>()
     })(bencode)?;
@@ -95,7 +95,7 @@ fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
     Ok((bencode, output_string.to_vec()))
 }
 
-fn number(bencode: &[u8]) -> IResult<&[u8], i64> {
+pub fn number(bencode: &[u8]) -> IResult<&[u8], i64> {
     let (bencode, _) = tag("i")(bencode)?;
     let (bencode, output_number) = cut(map_res(
         take_while1(|c| is_digit(c) || c == b'-'),
@@ -132,7 +132,7 @@ fn number(bencode: &[u8]) -> IResult<&[u8], i64> {
     Ok((bencode, output_number))
 }
 
-fn list(bencode: &[u8]) -> IResult<&[u8], Vec<Bencode>> {
+pub fn list(bencode: &[u8]) -> IResult<&[u8], Vec<Bencode>> {
     let (bencode, _) = tag("l")(bencode)?;
     let (bencode, output_list) = cut(many0(parse_bencode))(bencode)?;
     let (bencode, _) = cut(tag("e"))(bencode)?;
@@ -140,7 +140,7 @@ fn list(bencode: &[u8]) -> IResult<&[u8], Vec<Bencode>> {
     Ok((bencode, output_list))
 }
 
-fn dict(bencode: &[u8]) -> IResult<&[u8], BTreeMap<Vec<u8>, Bencode>> {
+pub fn dict(bencode: &[u8]) -> IResult<&[u8], BTreeMap<Vec<u8>, Bencode>> {
     let (bencode, _) = tag("d")(bencode)?;
     let (bencode, output_tuple_list) = cut(many0(pair(string, parse_bencode)))(bencode)?;
     let (bencode, _) = cut(tag("e"))(bencode)?;

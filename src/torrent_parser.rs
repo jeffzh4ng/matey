@@ -1,17 +1,32 @@
-use super::bencode_parser::Bencode;
+use super::bencode_parser::{self, parse_bencode, Bencode};
+use nom::{
+    bytes::complete::{tag, take_until},
+    combinator::recognize,
+    error::ErrorKind,
+};
+use sha1::{Digest, Sha1};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
-use std::{convert::TryFrom, fmt, num, path::PathBuf, string};
+use std::{
+    convert::{TryFrom, TryInto},
+    fmt, num,
+    path::PathBuf,
+    string,
+};
 
 #[derive(Clone, Debug)]
 pub struct Torrent {
-    announce: String,
-    info: TorrentInfo,
+    pub announce: String,
+    pub info: TorrentInfo,
+    pub info_hash: SHA1Hash,
 }
 
-impl TryFrom<Bencode> for Torrent {
+impl TryFrom<Vec<u8>> for Torrent {
     type Error = TorrentParsingError;
 
-    fn try_from(torrent_bencode: Bencode) -> Result<Self, Self::Error> {
+    fn try_from(torrent_bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        let (_, torrent_bencode) =
+            parse_bencode(&torrent_bytes).map_err(|_| TorrentParsingError::InvalidBencode)?;
+
         let mut torrent_dict = torrent_bencode
             .dict()
             .ok_or(TorrentParsingError::NotADict)?;
@@ -30,29 +45,34 @@ impl TryFrom<Bencode> for Torrent {
                 .context(FieldNotFound { field: "info" })?,
         )?;
 
-        Ok(Self { announce, info })
-    }
-}
+        let (bytes_after_info_token, _) =
+            // Rust cannot infer an error type by default, so we use nom's
+            // usual (Input, ErrorKind) type. See the nom docs for details.
+            take_until::<_, _, (_, ErrorKind)>("info")(torrent_bytes.as_slice())
+                // take_until doesn't consume the pattern itself,
+                // so we have to get rid of that part. It's guaranteed
+                // to be there, so we can just unwrap this.
+                .map(|(bytes, _)| tag::<_, _, (_, ErrorKind)>("info")(bytes).unwrap())
+                .map_err(|_| TorrentParsingError::InvalidBencode)?;
 
-#[derive(Clone, Copy)]
-struct SHA1Hash([u8; 20]);
+        let (_, info_bytes) = recognize(bencode_parser::dict)(bytes_after_info_token).unwrap();
 
-impl fmt::Debug for SHA1Hash {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{:02x}", byte)?;
-        }
+        let info_hash = SHA1Hash(Sha1::digest(info_bytes).as_slice().try_into().unwrap());
 
-        Ok(())
+        Ok(Self {
+            announce,
+            info,
+            info_hash,
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct TorrentInfo {
-    name: String,
-    files: Vec<TorrentFile>,
-    piece_len: u64,
-    pieces: Vec<SHA1Hash>,
+    pub name: String,
+    pub files: Vec<TorrentFile>,
+    pub piece_len: u64,
+    pub pieces: Vec<SHA1Hash>,
 }
 
 // TODO: single file mode
@@ -119,8 +139,8 @@ impl TryFrom<Bencode> for TorrentInfo {
 
 #[derive(Clone, Debug)]
 pub struct TorrentFile {
-    length: u64,
-    path: PathBuf,
+    pub length: u64,
+    pub path: PathBuf,
 }
 
 impl TryFrom<Bencode> for TorrentFile {
@@ -155,6 +175,19 @@ impl TryFrom<Bencode> for TorrentFile {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SHA1Hash([u8; 20]);
+
+impl fmt::Debug for SHA1Hash {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+
+        Ok(())
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Snafu)]
 pub enum TorrentParsingError {
@@ -172,4 +205,6 @@ pub enum TorrentParsingError {
     InvalidPath,
     #[snafu(display("Found a piece with length < 20"))]
     MismatchedPieceLength,
+    #[snafu(display("Provided bytes aren't valid bencode"))]
+    InvalidBencode,
 }
