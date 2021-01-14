@@ -1,10 +1,10 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, take, take_while1},
+    character::is_digit,
     combinator::{cut, map, map_res},
     multi::many0,
     sequence::pair,
-    character::is_digit,
     IResult,
 };
 use snafu::Snafu;
@@ -14,7 +14,7 @@ pub fn parse_bencode(bencode: &[u8]) -> IResult<&[u8], Bencode> {
     // TODO: return our custom error somehow
     alt((
         map(number, Bencode::Number),
-        map(string, Bencode::String),
+        map(string, Bencode::ByteString),
         map(list, Bencode::List),
         map(dict, Bencode::Dict),
     ))(bencode)
@@ -23,9 +23,43 @@ pub fn parse_bencode(bencode: &[u8]) -> IResult<&[u8], Bencode> {
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Bencode {
     Number(i64),
-    String(Vec<u8>),
+    ByteString(Vec<u8>),
     List(Vec<Bencode>),
     Dict(BTreeMap<Vec<u8>, Bencode>),
+}
+
+impl Bencode {
+    pub fn number(self) -> Option<i64> {
+        if let Self::Number(num) = self {
+            Some(num)
+        } else {
+            None
+        }
+    }
+
+    pub fn byte_string(self) -> Option<Vec<u8>> {
+        if let Self::ByteString(bytes) = self {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    pub fn list(self) -> Option<Vec<Bencode>> {
+        if let Self::List(list) = self {
+            Some(list)
+        } else {
+            None
+        }
+    }
+
+    pub fn dict(self) -> Option<BTreeMap<Vec<u8>, Bencode>> {
+        if let Self::Dict(dict) = self {
+            Some(dict)
+        } else {
+            None
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -52,10 +86,9 @@ pub enum BencodeNumberParsingError {
 }
 
 fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
-    let (bencode, num_characters) =
-        map_res(take_while1(is_digit), |bytes| {
-            String::from_utf8_lossy(bytes).parse::<usize>()
-        })(bencode)?;
+    let (bencode, num_characters) = map_res(take_while1(is_digit), |bytes| {
+        String::from_utf8_lossy(bytes).parse::<usize>()
+    })(bencode)?;
     let (bencode, _) = cut(tag(":"))(bencode)?;
     let (bencode, output_string) = cut(take(num_characters))(bencode)?;
 
@@ -123,7 +156,7 @@ mod test {
     fn basic_byte_string() {
         assert_eq!(
             parse_bencode(b"5:hello"),
-            Ok((b"" as &[u8], Bencode::String(b"hello".to_vec())))
+            Ok((b"" as &[u8], Bencode::ByteString(b"hello".to_vec())))
         );
     }
 
@@ -131,7 +164,7 @@ mod test {
     fn smaller_length() {
         assert_eq!(
             parse_bencode(b"5:helloworld"),
-            Ok((b"world" as &[u8], Bencode::String(b"hello".to_vec())))
+            Ok((b"world" as &[u8], Bencode::ByteString(b"hello".to_vec())))
         );
     }
 
@@ -139,7 +172,7 @@ mod test {
     fn empty_string() {
         assert_eq!(
             parse_bencode(b"0:"),
-            Ok((b"" as &[u8], Bencode::String(b"".to_vec())))
+            Ok((b"" as &[u8], Bencode::ByteString(b"".to_vec())))
         );
     }
 
@@ -147,7 +180,7 @@ mod test {
     fn empty_string_smaller_len() {
         assert_eq!(
             parse_bencode(b"0:world"),
-            Ok((b"world" as &[u8], Bencode::String(b"".to_vec())))
+            Ok((b"world" as &[u8], Bencode::ByteString(b"".to_vec())))
         );
     }
 
@@ -155,7 +188,7 @@ mod test {
     fn whitespace_in_string() {
         assert_eq!(
             parse_bencode(b"11:hello world"),
-            Ok((b"" as &[u8], Bencode::String(b"hello world".to_vec())))
+            Ok((b"" as &[u8], Bencode::ByteString(b"hello world".to_vec())))
         );
     }
 
@@ -165,7 +198,7 @@ mod test {
             parse_bencode(b"42:helloworldprogrammedtothinkandnottofeeeeel"),
             Ok((
                 b"" as &[u8],
-                Bencode::String(b"helloworldprogrammedtothinkandnottofeeeeel".to_vec())
+                Bencode::ByteString(b"helloworldprogrammedtothinkandnottofeeeeel".to_vec())
             ))
         );
     }
@@ -176,7 +209,7 @@ mod test {
             parse_bencode(b"50:hello world programmed to think and not to feeeeel"),
             Ok((
                 b"" as &[u8],
-                Bencode::String(b"hello world programmed to think and not to feeeeel".to_vec())
+                Bencode::ByteString(b"hello world programmed to think and not to feeeeel".to_vec())
             ))
         );
     }
@@ -198,17 +231,26 @@ mod test {
 
     #[test]
     fn positive_number() {
-        assert_eq!(parse_bencode(b"i88e"), Ok((b"" as &[u8], Bencode::Number(88))));
+        assert_eq!(
+            parse_bencode(b"i88e"),
+            Ok((b"" as &[u8], Bencode::Number(88)))
+        );
     }
 
     #[test]
     fn zero() {
-        assert_eq!(parse_bencode(b"i0e"), Ok((b"" as &[u8], Bencode::Number(0))));
+        assert_eq!(
+            parse_bencode(b"i0e"),
+            Ok((b"" as &[u8], Bencode::Number(0)))
+        );
     }
 
     #[test]
     fn negative_number() {
-        assert_eq!(parse_bencode(b"i-88e"), Ok((b"" as &[u8], Bencode::Number(-88))));
+        assert_eq!(
+            parse_bencode(b"i-88e"),
+            Ok((b"" as &[u8], Bencode::Number(-88)))
+        );
     }
 
     #[test]
@@ -256,8 +298,8 @@ mod test {
             Ok((
                 b"" as &[u8],
                 Bencode::List(vec![
-                    Bencode::String(b"hello".to_vec()),
-                    Bencode::String(b"world".to_vec())
+                    Bencode::ByteString(b"hello".to_vec()),
+                    Bencode::ByteString(b"world".to_vec())
                 ])
             ))
         );
@@ -273,7 +315,7 @@ mod test {
             Ok((
                 b"" as &[u8],
                 Bencode::List(vec![
-                    Bencode::String(b"hello".to_vec()),
+                    Bencode::ByteString(b"hello".to_vec()),
                     Bencode::Number(8)
                 ])
             ))
@@ -291,11 +333,11 @@ mod test {
                 b"" as &[u8],
                 Bencode::List(vec![
                     Bencode::List(vec![
-                        Bencode::String(b"hello".to_vec()),
-                        Bencode::String(b"world".to_vec())
+                        Bencode::ByteString(b"hello".to_vec()),
+                        Bencode::ByteString(b"world".to_vec())
                     ]),
                     Bencode::List(vec![
-                        Bencode::String(b"hello".to_vec()),
+                        Bencode::ByteString(b"hello".to_vec()),
                         Bencode::Number(8)
                     ])
                 ])
@@ -305,7 +347,10 @@ mod test {
 
     #[test]
     fn empty_list() {
-        assert_eq!(parse_bencode(b"le"), Ok((b"" as &[u8], Bencode::List(vec![]))));
+        assert_eq!(
+            parse_bencode(b"le"),
+            Ok((b"" as &[u8], Bencode::List(vec![])))
+        );
     }
 
     #[test]
@@ -335,7 +380,7 @@ mod test {
                 b"" as &[u8],
                 Bencode::Dict(
                     vec![
-                        (b"bar".to_vec(), Bencode::String(b"spam".to_vec())),
+                        (b"bar".to_vec(), Bencode::ByteString(b"spam".to_vec())),
                         (b"foo".to_vec(), Bencode::Number(88)),
                     ]
                     .into_iter()
