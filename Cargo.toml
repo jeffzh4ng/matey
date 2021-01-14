@@ -13,6 +13,8 @@ sha-1 = "0.9"
 url = "2.2"
 percent-encoding = "2.1"
 build-info = "0.0.21"
+reqwest = "0.11"
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "net", "macros"] }
 
 [build-dependencies]
 build-info-build = "0.0.21"

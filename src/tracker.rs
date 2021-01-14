@@ -13,15 +13,16 @@ const NEEDS_ESCAPE_BYTES: AsciiSet = NON_ALPHANUMERIC
 pub fn build_tracker_url(torrent: &Torrent, port: &str) -> Result<Url, Box<dyn std::error::Error>> {
     let mut url = Url::parse(&torrent.announce)?;
 
+    url.set_query(Some(&format!(
+        "info_hash={}",
+        &percent_encode(torrent.info_hash.as_ref(), &NEEDS_ESCAPE_BYTES)
+    )));
+
     url.query_pairs_mut()
-        .append_pair(
-            "info_hash",
-            &percent_encode(torrent.info_hash.as_ref(), &NEEDS_ESCAPE_BYTES).to_string(),
-        )
         .append_pair("port", port)
         .append_pair("uploaded", "0")
         .append_pair("downloaded", "0")
-        .append_pair("compact", "0")
+        .append_pair("compact", "1")
         .append_pair("event", "started")
         .append_pair(
             "left",
