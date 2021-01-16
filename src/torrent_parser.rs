@@ -24,26 +24,20 @@ impl TryFrom<Vec<u8>> for Torrent {
     type Error = TorrentParsingError;
 
     fn try_from(torrent_bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        let (_, torrent_bencode) =
-            parse_bencode(&torrent_bytes).map_err(|_| TorrentParsingError::InvalidBencode)?;
+        let mut torrent_dict = parse_bencode(&torrent_bytes)
+            .map_err(|_| TorrentParsingError::InvalidBencode)
+            .and_then(|(_, bencode)| bencode.dict().context(NotADict))?;
 
-        let mut torrent_dict = torrent_bencode
-            .dict()
-            .ok_or(TorrentParsingError::NotADict)?;
+        let announce = torrent_dict
+            .remove(b"announce" as &[u8])
+            .and_then(|val| val.byte_string())
+            .context(FieldNotFound { field: "announce" })
+            .and_then(|val| String::from_utf8(val).context(InvalidString))?;
 
-        let announce = String::from_utf8(
-            torrent_dict
-                .remove(b"announce" as &[u8])
-                .and_then(|val| val.byte_string())
-                .context(FieldNotFound { field: "announce" })?,
-        )
-        .context(InvalidString)?;
-
-        let info = TorrentInfo::try_from(
-            torrent_dict
-                .remove(b"info" as &[u8])
-                .context(FieldNotFound { field: "info" })?,
-        )?;
+        let info = torrent_dict
+            .remove(b"info" as &[u8])
+            .context(FieldNotFound { field: "info" })
+            .and_then(TorrentInfo::try_from)?;
 
         let (bytes_after_info_token, _) =
             // Rust cannot infer an error type by default, so we use nom's
@@ -80,17 +74,15 @@ impl TryFrom<Bencode> for TorrentInfo {
     type Error = TorrentParsingError;
 
     fn try_from(info_bencode: Bencode) -> Result<Self, Self::Error> {
-        let mut torrent_info_dict = info_bencode.dict().ok_or(TorrentParsingError::NotADict)?;
+        let mut torrent_info_dict = info_bencode.dict().context(NotADict)?;
 
-        let name = String::from_utf8(
-            torrent_info_dict
-                .remove(b"name" as &[u8])
-                .and_then(|val| val.byte_string())
-                .context(FieldNotFound {
-                    field: "info[name]",
-                })?,
-        )
-        .context(InvalidString)?;
+        let name = torrent_info_dict
+            .remove(b"name" as &[u8])
+            .and_then(|val| val.byte_string())
+            .context(FieldNotFound {
+                field: "info[name]",
+            })
+            .and_then(|val| String::from_utf8(val).context(InvalidString))?;
 
         let files = torrent_info_dict
             .remove(b"files" as &[u8])
@@ -102,15 +94,13 @@ impl TryFrom<Bencode> for TorrentInfo {
             .map(TorrentFile::try_from)
             .collect::<Result<_, _>>()?;
 
-        let piece_len = u64::try_from(
-            torrent_info_dict
-                .remove(b"piece length" as &[u8])
-                .and_then(|val| val.number())
-                .context(FieldNotFound {
-                    field: "info[piece length]",
-                })?,
-        )
-        .context(InvalidPieceLen)?;
+        let piece_len = torrent_info_dict
+            .remove(b"piece length" as &[u8])
+            .and_then(|val| val.number())
+            .context(FieldNotFound {
+                field: "info[piece length]",
+            })
+            .and_then(|val| u64::try_from(val).context(InvalidPieceLen))?;
 
         let all_pieces = torrent_info_dict
             .remove(b"pieces" as &[u8])
@@ -123,10 +113,7 @@ impl TryFrom<Bencode> for TorrentInfo {
 
         ensure!(remainder.is_empty(), MismatchedPieceLength);
 
-        let pieces = pieces
-            .iter()
-            .map(|&hash_bytes| SHA1Hash(hash_bytes))
-            .collect();
+        let pieces = pieces.iter().copied().map(SHA1Hash).collect();
 
         Ok(Self {
             name,
@@ -147,17 +134,15 @@ impl TryFrom<Bencode> for TorrentFile {
     type Error = TorrentParsingError;
 
     fn try_from(file_bencode: Bencode) -> Result<Self, Self::Error> {
-        let mut file_dict = file_bencode.dict().ok_or(TorrentParsingError::NotADict)?;
+        let mut file_dict = file_bencode.dict().context(NotADict)?;
 
-        let length = u64::try_from(
-            file_dict
-                .remove(b"length" as &[u8])
-                .and_then(|val| val.number())
-                .context(FieldNotFound {
-                    field: "file[length]",
-                })?,
-        )
-        .context(InvalidFileLen)?;
+        let length = file_dict
+            .remove(b"length" as &[u8])
+            .and_then(|val| val.number())
+            .context(FieldNotFound {
+                field: "file[length]",
+            })
+            .and_then(|val| u64::try_from(val).context(InvalidFileLen))?;
 
         let path = file_dict
             .remove(b"path" as &[u8])
