@@ -1,8 +1,8 @@
 use super::torrent_parser::Torrent;
 use build_info;
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use reqwest::Url;
 use std::time::SystemTime;
-use url::Url;
 
 const NEEDS_ESCAPE_BYTES: AsciiSet = NON_ALPHANUMERIC
     .remove(b'.')

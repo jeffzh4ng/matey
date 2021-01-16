@@ -7,14 +7,13 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-nom = "6"
-snafu = "0.6"
+nom = { version = "6", default-features = false, features = ["std"] }
+snafu = { version = "0.6", default-features = false, features = ["std"] }
 sha-1 = "0.9"
-url = "2.2"
 percent-encoding = "2.1"
-build-info = "0.0.21"
+build-info = { version = "0.0.21", default-features = false }
 reqwest = "0.11"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "net", "macros"] }
 
 [build-dependencies]
-build-info-build = "0.0.21"
+build-info-build = { version = "0.0.21", default-features = false }
