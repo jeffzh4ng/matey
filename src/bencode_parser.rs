@@ -4,10 +4,10 @@ use nom::{
     character::is_digit,
     combinator::{cut, map, map_res},
     multi::many0,
-    sequence::pair,
+    sequence::{delimited, pair, terminated},
     IResult,
 };
-use snafu::Snafu;
+use snafu::{ensure, ResultExt, Snafu};
 use std::{collections::BTreeMap, num};
 
 pub fn parse_bencode(bencode: &[u8]) -> IResult<&[u8], Bencode> {
@@ -85,65 +85,53 @@ pub enum BencodeNumberParsingError {
     },
 }
 
-pub fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
-    let (bencode, num_characters) = map_res(take_while1(is_digit), |bytes| {
-        String::from_utf8_lossy(bytes).parse::<usize>()
-    })(bencode)?;
-    let (bencode, _) = cut(tag(":"))(bencode)?;
+fn string(bencode: &[u8]) -> IResult<&[u8], Vec<u8>> {
+    let (bencode, num_characters) = terminated(
+        map_res(take_while1(is_digit), |bytes| {
+            String::from_utf8_lossy(bytes).parse::<usize>()
+        }),
+        cut(tag(":")),
+    )(bencode)?;
+
     let (bencode, output_string) = cut(take(num_characters))(bencode)?;
 
     Ok((bencode, output_string.to_vec()))
 }
 
-pub fn number(bencode: &[u8]) -> IResult<&[u8], i64> {
-    let (bencode, _) = tag("i")(bencode)?;
-    let (bencode, output_number) = cut(map_res(
-        take_while1(|c| is_digit(c) || c == b'-'),
-        |bytes| {
-            let s = String::from_utf8_lossy(bytes);
+fn number(bencode: &[u8]) -> IResult<&[u8], i64> {
+    delimited(
+        tag("i"),
+        cut(map_res(
+            take_while1(|c| is_digit(c) || c == b'-'),
+            |bytes| -> Result<_, BencodeNumberParsingError> {
+                let number_str = String::from_utf8_lossy(bytes);
 
-            // TODO: clean up this error handling
-            let number = s
-                .parse()
-                .map_err(|e| BencodeNumberParsingError::ParseError { source: e })?;
-            let first_char = s
-                .chars()
-                .next()
-                .ok_or(BencodeNumberParsingError::EmptyNumber)?;
+                let number = number_str.parse().context(ParseError)?;
 
-            if first_char == '-' {
-                // There must be a second character, otherwise parse would have failed
-                if s.chars().nth(1).unwrap() == '0' {
-                    return if number == 0 {
-                        Err(BencodeNumberParsingError::NegativeZero)
-                    } else {
-                        Err(BencodeNumberParsingError::LeadingZero)
-                    };
+                if bytes[0] == b'-' {
+                    ensure!(number != 0, NegativeZero);
+                    ensure!(bytes[1] != b'0', LeadingZero);
                 }
-            } else if first_char == '0' && s.len() > 1 {
-                return Err(BencodeNumberParsingError::LeadingZero);
-            }
 
-            Ok(number)
-        },
-    ))(bencode)?;
-    let (bencode, _) = cut(tag("e"))(bencode)?;
+                ensure!(bytes[0] != b'0' || number_str.len() == 1, LeadingZero);
 
-    Ok((bencode, output_number))
+                Ok(number)
+            },
+        )),
+        cut(tag("e")),
+    )(bencode)
 }
 
-pub fn list(bencode: &[u8]) -> IResult<&[u8], Vec<Bencode>> {
-    let (bencode, _) = tag("l")(bencode)?;
-    let (bencode, output_list) = cut(many0(parse_bencode))(bencode)?;
-    let (bencode, _) = cut(tag("e"))(bencode)?;
-
-    Ok((bencode, output_list))
+fn list(bencode: &[u8]) -> IResult<&[u8], Vec<Bencode>> {
+    delimited(tag("l"), cut(many0(parse_bencode)), cut(tag("e")))(bencode)
 }
 
-pub fn dict(bencode: &[u8]) -> IResult<&[u8], BTreeMap<Vec<u8>, Bencode>> {
-    let (bencode, _) = tag("d")(bencode)?;
-    let (bencode, output_tuple_list) = cut(many0(pair(string, parse_bencode)))(bencode)?;
-    let (bencode, _) = cut(tag("e"))(bencode)?;
+fn dict(bencode: &[u8]) -> IResult<&[u8], BTreeMap<Vec<u8>, Bencode>> {
+    let (bencode, output_tuple_list) = delimited(
+        tag("d"),
+        cut(many0(pair(string, parse_bencode))),
+        cut(tag("e")),
+    )(bencode)?;
 
     Ok((bencode, output_tuple_list.into_iter().collect()))
 }

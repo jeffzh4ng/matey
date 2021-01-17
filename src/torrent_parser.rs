@@ -1,8 +1,8 @@
-use super::bencode_parser::{self, parse_bencode, Bencode};
+use super::bencode_parser::{parse_bencode, Bencode};
 use nom::{
     bytes::complete::{tag, take_until},
     combinator::recognize,
-    error::ErrorKind,
+    sequence::preceded,
 };
 use sha1::{Digest, Sha1};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -39,18 +39,15 @@ impl TryFrom<Vec<u8>> for Torrent {
             .context(FieldNotFound { field: "info" })
             .and_then(TorrentInfo::try_from)?;
 
-        let (bytes_after_info_token, _) =
-            // Rust cannot infer an error type by default, so we use nom's
-            // usual (Input, ErrorKind) type. See the nom docs for details.
-            take_until::<_, _, (_, ErrorKind)>("info")(torrent_bytes.as_slice())
-                // take_until doesn't consume the pattern itself,
-                // so we have to get rid of that part. It's guaranteed
-                // to be there, so we can just unwrap this.
-                .map(|(bytes, _)| tag::<_, _, (_, ErrorKind)>("info")(bytes).unwrap())
-                .map_err(|_| TorrentParsingError::InvalidBencode)?;
+        let (_, info_bytes) = preceded(
+            take_until("info"),
+            // take_until does not consume the pattern itself, so we have to do it
+            preceded(tag("info"), recognize(parse_bencode)),
+        )(&torrent_bytes)
+        .map_err(|_| TorrentParsingError::InvalidBencode)?;
 
-        let (_, info_bytes) = recognize(bencode_parser::dict)(bytes_after_info_token).unwrap();
-
+        // Sha1::digest does not make use of const generics yet, but we know it always
+        // returns a [u8; 20] specifically, so unwrapping the try_into here is ok.
         let info_hash = SHA1Hash(Sha1::digest(info_bytes).as_slice().try_into().unwrap());
 
         Ok(Self {
