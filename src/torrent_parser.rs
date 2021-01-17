@@ -69,7 +69,6 @@ pub struct TorrentInfo {
     pub pieces: Vec<SHA1Hash>,
 }
 
-// TODO: single file mode
 impl TryFrom<Bencode> for TorrentInfo {
     type Error = TorrentParsingError;
 
@@ -84,15 +83,26 @@ impl TryFrom<Bencode> for TorrentInfo {
             })
             .and_then(|val| String::from_utf8(val).context(InvalidString))?;
 
-        let files = torrent_info_dict
+        let files = if let Some(multiple_files) = torrent_info_dict
             .remove(b"files" as &[u8])
             .and_then(|val| val.list())
-            .context(FieldNotFound {
-                field: "info[files]",
-            })?
-            .into_iter()
-            .map(TorrentFile::try_from)
-            .collect::<Result<_, _>>()?;
+        {
+            multiple_files
+                .into_iter()
+                .map(TorrentFile::try_from)
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![TorrentFile {
+                length: torrent_info_dict
+                    .remove(b"length" as &[u8])
+                    .and_then(|val| val.number())
+                    .context(FieldNotFound {
+                        field: "info[length]",
+                    })
+                    .and_then(|val| u64::try_from(val).context(InvalidFileLen))?,
+                path: name.clone().into(),
+            }]
+        };
 
         let piece_len = torrent_info_dict
             .remove(b"piece length" as &[u8])
