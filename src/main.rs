@@ -36,9 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let resp = reqwest::get(tracker_url).await?;
 
-    let peerlist = build_peerlist(&resp.bytes().await?).ok_or("Failed to find valid peerlist in tracker response")?;
+    println!("----Announced to tracker----");
 
-    println!("Attempting handshake");
+    let peerlist = build_peerlist(&resp.bytes().await?)
+        .ok_or("Failed to find valid peerlist in tracker response")?;
+
+    println!("----Attempting handshake----");
 
     // This attempts a connection with each peer in turn until one succeeds.
     let mut peer = TcpStream::connect(peerlist.as_slice()).await?;
@@ -47,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     peer.write_all(
         &[
             // 0x13 is 19 in decimal, which is the pstrlen. The next eight bytes
-            // after the pstr itself are 0s, which are obviously 0x00, which are
+            // after the pstr itself are 0s, which are obviously 0x00. These are
             // the reserved bytes.
             b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00" as &[u8],
             torrent.info_hash.as_ref(),
@@ -57,22 +60,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("Sent handshake to peer {}", peer.peer_addr()?);
+    println!("----Sent handshake to peer {}----", peer.peer_addr()?);
 
     let mut buf = [0u8; 1024];
+    let mut choked = true;
+    let mut request = false;
 
     loop {
         match peer.read(&mut buf).await {
             Ok(n) if n == 0 => {
-                println!("Connection closed");
+                println!("----Connection closed----");
                 break;
             }
             Ok(n) => {
                 let msg = &buf[..n];
-                println!("\n\n{:?}\n{}", msg, String::from_utf8_lossy(msg));
+                println!("\n{:?}\n{}\n", msg, String::from_utf8_lossy(msg));
+
+                if choked {
+                    // unchoke (id = 1) followed by interested (id = 2)
+                    peer.write_all(&[0, 0, 0, 1, 1, 0, 0, 0, 1, 2]).await?;
+                    choked = false;
+                    println!("----Sent unchoked & interested----");
+                }
+
+                if msg == [0u8, 0, 0, 1, 1] && !request {
+                    println!("----Peer unchoked us, sending request----");
+
+                    peer.write_all(
+                        &[
+                            // request (id = 6)
+                            &[0u8, 0, 0, 13, 6] as &[u8],
+                            &0u32.to_be_bytes(), // 0th piece
+                            &0u32.to_be_bytes(), // starting from index 0
+                            &2u32.pow(10).to_be_bytes(), // 2**10=1024 bytes or 1KB
+                        ]
+                        .concat(),
+                    )
+                    .await?;
+
+                    request = true;
+                }
             }
             Err(e) => {
-                eprintln!("failed to read token from socket; err = {:?}", e);
+                eprintln!("----failed to read token from socket; err = {:?}----", e);
                 break;
             }
         }
