@@ -10,7 +10,11 @@ const NEEDS_ESCAPE_BYTES: AsciiSet = NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-pub fn build_tracker_url(torrent: &Torrent, port: &str) -> Result<Url, Box<dyn std::error::Error>> {
+pub fn build_tracker_url(
+    torrent: &Torrent,
+    port: &str,
+    peer_id: &str,
+) -> Result<Url, Box<dyn std::error::Error>> {
     let mut url = Url::parse(&torrent.announce)?;
 
     url.set_query(Some(&format!(
@@ -34,7 +38,7 @@ pub fn build_tracker_url(torrent: &Torrent, port: &str) -> Result<Url, Box<dyn s
                 .sum::<u64>()
                 .to_string(),
         )
-        .append_pair("peer_id", &build_peer_id());
+        .append_pair("peer_id", peer_id);
 
     Ok(url)
 }

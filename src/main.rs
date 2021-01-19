@@ -6,16 +6,24 @@ mod tracker;
 
 use std::{convert::TryFrom, env, fs};
 use torrent_parser::Torrent;
-use tracker::build_tracker_url;
+use tracker::{build_peer_id, build_tracker_url};
 
 use bencode_parser::{parse_bencode, Bencode};
 use std::{
     convert::TryInto,
     net::{IpAddr, SocketAddr},
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+
+const PORT: u16 = 6881;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let peer_id = build_peer_id();
+
     let torrent_bytes = fs::read(
         env::args()
             .nth(1)
@@ -24,11 +32,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let torrent = Torrent::try_from(torrent_bytes)?;
 
-    let tracker_url = build_tracker_url(&torrent, "6881")?;
+    let tracker_url = build_tracker_url(&torrent, &PORT.to_string(), &peer_id)?;
 
     let resp = reqwest::get(tracker_url).await?;
 
-    dbg!(build_peerlist(&resp.bytes().await?));
+    let peerlist = build_peerlist(&resp.bytes().await?).ok_or("Failed to find valid peerlist in tracker response")?;
+
+    println!("Attempting handshake");
+
+    // This attempts a connection with each peer in turn until one succeeds.
+    let mut peer = TcpStream::connect(peerlist.as_slice()).await?;
+
+    // Handshake
+    peer.write_all(
+        &[
+            // 0x13 is 19 in decimal, which is the pstrlen. The next eight bytes
+            // after the pstr itself are 0s, which are obviously 0x00, which are
+            // the reserved bytes.
+            b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00" as &[u8],
+            torrent.info_hash.as_ref(),
+            peer_id.as_bytes(),
+        ]
+        .concat(),
+    )
+    .await?;
+
+    println!("Sent handshake to peer {}", peer.peer_addr()?);
+
+    let mut buf = [0u8; 1024];
+
+    loop {
+        match peer.read(&mut buf).await {
+            Ok(n) if n == 0 => {
+                println!("Connection closed");
+                break;
+            }
+            Ok(n) => {
+                let msg = &buf[..n];
+                println!("\n\n{:?}\n{}", msg, String::from_utf8_lossy(msg));
+            }
+            Err(e) => {
+                eprintln!("failed to read token from socket; err = {:?}", e);
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
