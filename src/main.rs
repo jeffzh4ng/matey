@@ -90,8 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &[
                             // request (id = 6)
                             &[0u8, 0, 0, 13, 6] as &[u8],
-                            &0u32.to_be_bytes(), // 0th piece
-                            &0u32.to_be_bytes(), // starting from index 0
+                            &0u32.to_be_bytes(),         // 0th piece
+                            &0u32.to_be_bytes(),         // starting from index 0
                             &2u32.pow(10).to_be_bytes(), // 2**10=1024 bytes or 1KB
                         ]
                         .concat(),
@@ -116,27 +116,30 @@ fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
 
     let mut response_dict = response_bencode.dict()?;
 
-    let peer_list = response_dict.remove(b"peers" as &[u8])?;
+    let (peers, v6_peers) = (
+        response_dict.remove(b"peers" as &[u8]),
+        response_dict.remove(b"peers6" as &[u8]),
+    );
 
-    match peer_list {
+    if peers.is_none() && v6_peers.is_none() {
+        return None;
+    }
+
+    match (
+        peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
+        v6_peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
+    ) {
         // compact mode
-        Bencode::ByteString(ipv4_peer_bytes) => {
-            // This key only exists in compact mode, but some trackers
-            // don't support it, so it might not exist even then.
-            let ipv6_peer_bytes = response_dict
-                .remove(b"peers6" as &[u8])
-                .and_then(|val| val.byte_string())
-                .unwrap_or_default();
+        (Bencode::ByteString(v4_peer_bytes), Bencode::ByteString(v6_peer_bytes)) => {
+            let (v4_chunks, v4_remainder) = v4_peer_bytes.as_chunks::<6>();
+            let (v6_chunks, v6_remainder) = v6_peer_bytes.as_chunks::<18>();
 
-            let (ipv4_chunks, ipv4_remainder) = ipv4_peer_bytes.as_chunks::<6>();
-            let (ipv6_chunks, ipv6_remainder) = ipv6_peer_bytes.as_chunks::<18>();
-
-            if !(ipv4_remainder.is_empty() && ipv6_remainder.is_empty()) {
+            if !(v4_remainder.is_empty() && v6_remainder.is_empty()) {
                 return None;
             }
 
             Some(
-                ipv4_chunks
+                v4_chunks
                     .iter()
                     .map(|&addr_bytes| {
                         (
@@ -144,7 +147,7 @@ fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
                             u16::from_be_bytes(addr_bytes[4..].try_into().unwrap()),
                         )
                     })
-                    .chain(ipv6_chunks.iter().map(|&addr_bytes| {
+                    .chain(v6_chunks.iter().map(|&addr_bytes| {
                         (
                             IpAddr::from(<[u8; 16]>::try_from(&addr_bytes[0..16]).unwrap()),
                             u16::from_be_bytes(addr_bytes[16..].try_into().unwrap()),
@@ -155,7 +158,7 @@ fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
             )
         }
         // non-compact mode
-        Bencode::List(peer_list) => peer_list
+        (Bencode::List(peer_list), _) => peer_list
             .into_iter()
             .map(|peer| {
                 let mut peer_dict = peer.dict()?;
@@ -172,7 +175,7 @@ fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
 
                 Some(SocketAddr::new(ip, port))
             })
-            .collect::<Option<_>>(),
+            .collect(),
         _ => None,
     }
 }
