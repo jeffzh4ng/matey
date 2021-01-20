@@ -4,18 +4,20 @@ mod bencode_parser;
 mod torrent_parser;
 mod tracker;
 
-use std::{convert::TryFrom, env, fs};
+use std::{collections::HashSet, convert::TryFrom, env, fs};
 use torrent_parser::Torrent;
 use tracker::{build_peer_id, build_tracker_url};
 
+use async_trait::async_trait;
 use bencode_parser::{parse_bencode, Bencode};
 use std::{
     convert::TryInto,
+    io,
     net::{IpAddr, SocketAddr},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    net::{TcpStream, ToSocketAddrs},
 };
 
 const PORT: u16 = 6881;
@@ -41,66 +43,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peerlist = build_peerlist(&resp.bytes().await?)
         .ok_or("Failed to find valid peerlist in tracker response")?;
 
-    println!("----Attempting handshake----");
-
+    println!("----Creating TcpPeerCommunicator----");
+    
     // This attempts a connection with each peer in turn until one succeeds.
-    let mut peer = TcpStream::connect(peerlist.as_slice()).await?;
+    let mut peer = TcpPeerCommunicator::new(peerlist.as_slice(), torrent.info_hash.as_ref(), peer_id.as_bytes()).await?;
 
-    // Handshake
-    peer.write_all(
-        &[
-            // 0x13 is 19 in decimal, which is the pstrlen. The next eight bytes
-            // after the pstr itself are 0s, which are obviously 0x00. These are
-            // the reserved bytes.
-            b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00" as &[u8],
-            torrent.info_hash.as_ref(),
-            peer_id.as_bytes(),
-        ]
-        .concat(),
-    )
-    .await?;
-
-    println!("----Sent handshake to peer {}----", peer.peer_addr()?);
-
-    let mut buf = [0u8; 1024];
     let mut choked = true;
     let mut request = false;
 
     loop {
-        match peer.read(&mut buf).await {
-            Ok(n) if n == 0 => {
-                println!("----Connection closed----");
-                break;
-            }
-            Ok(n) => {
-                let msg = &buf[..n];
-                println!("\n{:?}\n{}\n", msg, String::from_utf8_lossy(msg));
+        match peer.read().await {
+            Ok(Some(msg)) => {
+                dbg!(&msg);
 
                 if choked {
-                    // unchoke (id = 1) followed by interested (id = 2)
-                    peer.write_all(&[0, 0, 0, 1, 1, 0, 0, 0, 1, 2]).await?;
+                    // TODO: Provide a way to pipeline writes? Builder pattern, maybe?
+                    peer.write(Message::Unchoke).await?;
+                    peer.write(Message::Interested).await?;
+
                     choked = false;
+
                     println!("----Sent unchoked & interested----");
                 }
 
-                if msg == [0u8, 0, 0, 1, 1] && !request {
+                if msg == Message::Unchoke && !request {
                     println!("----Peer unchoked us, sending request----");
 
-                    peer.write_all(
-                        &[
-                            // request (id = 6)
-                            &[0u8, 0, 0, 13, 6] as &[u8],
-                            &0u32.to_be_bytes(),         // 0th piece
-                            &0u32.to_be_bytes(),         // starting from index 0
-                            &2u32.pow(10).to_be_bytes(), // 2**10=1024 bytes or 1KB
-                        ]
-                        .concat(),
-                    )
-                    .await?;
+                    peer.write(Message::Request {
+                        index: 0,
+                        begin: 0,
+                        length: 2u32.pow(10), // 2**10 = 1024 bytes or 1KB
+                    }).await?;
 
                     request = true;
                 }
-            }
+            },
+            Ok(None) => {
+                println!("Peer sent keep-alive message");
+            },
             Err(e) => {
                 eprintln!("----failed to read token from socket; err = {:?}----", e);
                 break;
@@ -111,6 +91,231 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Message {
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have {
+        piece_index: u32,
+    },
+    BitField {
+        bitfield: HashSet<u32>,
+    },
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+}
+
+#[async_trait]
+trait PeerCommunicator {
+    type Err;
+
+    async fn read(&mut self) -> Result<Option<Message>, Self::Err>;
+    async fn write(&mut self, message: Message) -> Result<(), Self::Err>;
+}
+
+struct TcpPeerCommunicator {
+    stream: BufStream<TcpStream>,
+}
+
+impl TcpPeerCommunicator {
+    async fn new<A: ToSocketAddrs>(addr: A, info_hash: &[u8], peer_id: &[u8]) -> io::Result<Self> {
+        // 0x13 is 19 in decimal, which is the pstrlen. The next eight bytes
+        // after the pstr itself are 0s, which are obviously 0x00. These are
+        // the reserved bytes.
+        let header = b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00";
+
+        let mut stream = BufStream::new(TcpStream::connect(addr).await?);
+
+        println!("----Sending handshake to {}----", stream.get_ref().peer_addr()?);
+
+        // Send handshake
+        stream.write_all(
+            &[
+                header,
+                info_hash,
+                peer_id,
+            ]
+            .concat(),
+        )
+        .await?;
+
+        println!("----Sent handshake----");
+
+        let mut buf = vec![0; 68];
+
+        loop {
+            let n = stream.read(&mut buf).await?;
+
+            if n == 0 {
+                panic!("Connection closed");
+            }
+
+            dbg!(&buf, String::from_utf8_lossy(&buf));
+
+            if n == 68 {
+                break;
+            }
+        }
+
+        // // Recieve handshake
+        // // TODO: custom error handling
+        // stream.read_exact(&mut buf).await?;
+
+        println!("----Recieved handshake----");
+
+        if &buf[0..28] != header {
+            panic!("Handshake does not match");
+        }
+
+        if &buf[28..48] != info_hash {
+            panic!("Infohash does not match");
+        }
+
+        Ok(TcpPeerCommunicator { stream })
+    }
+}
+
+#[async_trait]
+impl PeerCommunicator for TcpPeerCommunicator {
+    type Err = io::Error;
+
+    async fn read(&mut self) -> Result<Option<Message>, Self::Err> {
+        use Message::*;
+
+        let len = self.stream.read_u32().await?;
+
+        if len == 0 {
+            return Ok(None);
+        }
+
+        let id = self.stream.read_u8().await?;
+
+        Ok(Some(if len == 1 {
+            match id {
+                0 => Choke,
+                1 => Unchoke,
+                2 => Interested,
+                3 => NotInterested,
+                _ => todo!(), // TODO: return custom error type
+            }
+        } else {
+            // TODO: reuse buffers across read calls?
+            // maybe store it in the struct itself?
+            let mut payload = vec![0; len as usize - 1];
+            self.stream.read_exact(&mut payload).await?;
+
+            match id {
+                4 => Have {
+                    piece_index: u32::from_be_bytes(payload.try_into().unwrap()),
+                },
+                5 => BitField { bitfield: HashSet::new() }, // TODO: parse the bitfield,
+                6 => {
+                    // TODO: ensure len == 13
+
+                    Request {
+                        index: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
+                        begin: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                        length: u32::from_be_bytes(payload[8..12].try_into().unwrap()),
+                    }
+                },
+                7 => {
+                    // TODO: ensure len >= 9
+
+                    let block = payload.split_off(8);
+
+                    Piece {
+                        index: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
+                        begin: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                        block,
+                    }
+                },
+                8 => {
+                    // TODO: ensure len == 13
+
+                    Cancel {
+                        index: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
+                        begin: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                        length: u32::from_be_bytes(payload[8..12].try_into().unwrap()),
+                    }
+                },
+                _ => todo!() // TODO: return custom error type
+            }
+        }))
+    }
+
+    async fn write(&mut self, message: Message) -> Result<(), Self::Err> {
+        use Message::*;
+
+        let (id, payload) = match message {
+            Choke => (0, vec![]),
+            Unchoke => (1, vec![]),
+            Interested => (2, vec![]),
+            NotInterested => (3, vec![]),
+            Have { piece_index } => (4, piece_index.to_be_bytes().to_vec()),
+            BitField { bitfield } => todo!(),
+            Request {
+                index,
+                begin,
+                length,
+            } => (
+                6,
+                [
+                    index.to_be_bytes(),
+                    begin.to_be_bytes(),
+                    length.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+            Piece {
+                index,
+                begin,
+                block,
+            } => (
+                7,
+                [&index.to_be_bytes() as &[u8], &begin.to_be_bytes(), &block].concat(),
+            ),
+            Cancel {
+                index,
+                begin,
+                length,
+            } => (
+                8,
+                [
+                    index.to_be_bytes(),
+                    begin.to_be_bytes(),
+                    length.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        };
+
+        self.stream.write_u32(payload.len() as u32 + 1).await?;
+        self.stream.write_u8(id).await?;
+        self.stream.write_all(&payload).await?;
+
+        self.stream.flush().await?;
+
+        Ok(())
+    }
+}
+
+// TODO: deal with peers & peers6 sometimes either being there,
+// or both being there
 fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
     let (_, response_bencode) = parse_bencode(response).ok()?;
 
