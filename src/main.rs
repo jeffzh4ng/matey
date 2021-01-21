@@ -4,7 +4,7 @@ mod bencode_parser;
 mod torrent_parser;
 mod tracker;
 
-use std::{collections::HashSet, convert::TryFrom, env, fs};
+use std::{convert::TryFrom, env, fs};
 use torrent_parser::Torrent;
 use tracker::{build_peer_id, build_tracker_url};
 
@@ -20,6 +20,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpStream, ToSocketAddrs},
 };
+use bitvec::prelude::*;
 
 const PORT: u16 = 6881;
 
@@ -127,7 +128,7 @@ enum Message {
         piece_index: u32,
     },
     BitField {
-        bitfield: HashSet<u32>,
+        bitfield: BitVec<Msb0, u8>,
     },
     Request {
         index: u32,
@@ -235,9 +236,8 @@ impl PeerCommunicator for TcpPeerCommunicator {
 
                 self.stream.read_exact(&mut bitfield).await?;
 
-                // TODO: parse the bitfield
                 BitField {
-                    bitfield: HashSet::new(),
+                    bitfield: BitVec::from_vec(bitfield),
                 }
             }
             6 | 8 => {
@@ -292,7 +292,10 @@ impl PeerCommunicator for TcpPeerCommunicator {
             Interested => (2, vec![]),
             NotInterested => (3, vec![]),
             Have { piece_index } => (4, piece_index.to_be_bytes().to_vec()),
-            BitField { bitfield } => todo!(),
+            BitField { bitfield } => (
+                5,
+                bitfield.into_vec()
+            ),
             Request {
                 index,
                 begin,
