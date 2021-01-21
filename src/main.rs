@@ -25,7 +25,11 @@ const PORT: u16 = 6881;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
     let peer_id = build_peer_id();
+
+    log::info!("Our peer ID: {}", peer_id);
 
     let torrent_bytes = fs::read(
         env::args()
@@ -35,16 +39,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let torrent = Torrent::try_from(torrent_bytes)?;
 
+    log::info!("Parsed torrent file");
+
     let tracker_url = build_tracker_url(&torrent, &PORT.to_string(), &peer_id)?;
+
+    log::info!("Announcing to tracker at URL: {}", tracker_url);
 
     let resp = reqwest::get(tracker_url).await?;
 
-    println!("----Announced to tracker----");
+    log::info!("Got response from tracker");
 
     let peerlist = build_peerlist(&resp.bytes().await?)
         .ok_or("Failed to find valid peerlist in tracker response")?;
 
-    println!("----Creating TcpPeerCommunicator----");
+    log::info!("Parsed peerlist from tracker response");
 
     // This attempts a connection with each peer in turn until one succeeds.
     let mut peer = TcpPeerCommunicator::new(
@@ -53,6 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_id.as_bytes(),
     )
     .await?;
+
+    log::info!("Established BitTorrent connection with peer");
 
     let mut choked = true;
     let mut request = false;
@@ -66,9 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block,
                 } = &msg
                 {
-                    dbg!(index, begin, String::from_utf8_lossy(block));
+                    log::info!("Recieved piece {} at offset {}:\n {:?}", index, begin, String::from_utf8_lossy(block));
                 } else {
-                    dbg!(&msg);
+                    log::info!("Recieved message from peer: {:?}", &msg);
                 }
 
                 if choked {
@@ -78,11 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     choked = false;
 
-                    println!("----Sent unchoked & interested----");
+                    log::info!("Sent unchoke and interested to peer");
                 }
 
                 if msg == Message::Unchoke && !request {
-                    println!("----Peer unchoked us, sending request----");
+                    log::info!("Peer unchoked us, sending request");
 
                     peer.write(Message::Request {
                         index: 0,
@@ -95,10 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(None) => {
-                println!("Peer sent keep-alive message");
+                log::debug!("Peer sent keep-alive message");
             }
             Err(e) => {
-                eprintln!("----failed to read token from socket; err = {:?}----", e);
+                log::error!("failed to read token from socket; err = {:?}", e);
                 break;
             }
         }
@@ -156,6 +166,8 @@ impl TcpPeerCommunicator {
     ) -> Result<Self, TcpPeerError> {
         let mut stream = BufStream::new(TcpStream::connect(addr).await?);
 
+        log::debug!("Opened TcpStream for address: {}", stream.get_ref().peer_addr().unwrap());
+
         // Send handshake
         stream
             .write_all(
@@ -173,12 +185,14 @@ impl TcpPeerCommunicator {
 
         stream.flush().await?;
 
+        log::debug!("Sent handshake to peer");
+
         let mut buf = vec![0; 68];
 
         // Recieve handshake
         stream.read_exact(&mut buf).await?;
 
-        dbg!(&buf, String::from_utf8_lossy(&buf));
+        log::debug!("Recieved handshake reply from peer: {:?}", String::from_utf8_lossy(&buf));
 
         ensure!(&buf[28..48] == info_hash, HandshakeInfoHash);
 
@@ -201,7 +215,8 @@ impl PeerCommunicator for TcpPeerCommunicator {
 
         let id = self.stream.read_u8().await?;
 
-        dbg!(len.to_be_bytes(), len, id);
+        log::trace!("len bytes = {:?}", len.to_be_bytes());
+        log::debug!("Message with len = {}, id = {}", len, id);
 
         Ok(Some(match id {
             0 => Choke,
