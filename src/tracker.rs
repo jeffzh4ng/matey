@@ -1,8 +1,7 @@
 use super::torrent_parser::Torrent;
-use build_info;
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::Url;
-use std::time::SystemTime;
+use rand::{Rng, thread_rng, distributions};
 
 const NEEDS_ESCAPE_BYTES: AsciiSet = NON_ALPHANUMERIC
     .remove(b'.')
@@ -44,22 +43,17 @@ pub fn build_tracker_url(
 }
 
 pub fn build_peer_id() -> String {
-    let version_str = format!(
-        "{:0^4}",
-        build_info::format!("{}", $.crate_info.version)
-            .to_owned()
-            .replace(".", "")
-    );
-
-    let mut time_str = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        .to_string();
-
-    time_str.truncate(12);
-
     let client_id = "MS"; // the Matey Ship! 🏴‍☠️
 
-    format!("-{}{}-{:0^12}", client_id, version_str, time_str)
+    let mut version_str = env!("CARGO_PKG_VERSION").to_owned().replace(".", "");
+
+    version_str.truncate(4);
+
+    let suffix = thread_rng()
+        .sample_iter(&distributions::Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect::<String>();
+
+    format!("-{}{:0>4}-{}", client_id, version_str, suffix)
 }

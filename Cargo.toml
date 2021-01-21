@@ -11,10 +11,7 @@ nom = { version = "6", default-features = false, features = ["std"] }
 snafu = { version = "0.6", default-features = false, features = ["std"] }
 sha-1 = "0.9"
 percent-encoding = "2.1"
-build-info = { version = "0.0.21", default-features = false }
 reqwest = "0.11"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "net", "macros"] }
 async-trait = "0.1"
-
-[build-dependencies]
-build-info-build = { version = "0.0.21", default-features = false }
+rand = "0.8"
