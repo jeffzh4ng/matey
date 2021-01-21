@@ -1,7 +1,12 @@
+use super::bencode_parser::{parse_bencode, Bencode};
 use super::torrent_parser::Torrent;
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use rand::{distributions, thread_rng, Rng};
 use reqwest::Url;
-use rand::{Rng, thread_rng, distributions};
+use std::{
+    convert::{TryFrom, TryInto},
+    net::{IpAddr, SocketAddr},
+};
 
 const NEEDS_ESCAPE_BYTES: AsciiSet = NON_ALPHANUMERIC
     .remove(b'.')
@@ -56,4 +61,73 @@ pub fn build_peer_id() -> String {
         .collect::<String>();
 
     format!("-{}{:0>4}-{}", client_id, version_str, suffix)
+}
+
+pub fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
+    let (_, response_bencode) = parse_bencode(response).ok()?;
+
+    let mut response_dict = response_bencode.dict()?;
+
+    let (peers, v6_peers) = (
+        response_dict.remove(b"peers" as &[u8]),
+        response_dict.remove(b"peers6" as &[u8]),
+    );
+
+    if peers.is_none() && v6_peers.is_none() {
+        return None;
+    }
+
+    match (
+        peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
+        v6_peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
+    ) {
+        // compact mode
+        (Bencode::ByteString(v4_peer_bytes), Bencode::ByteString(v6_peer_bytes)) => {
+            let (v4_chunks, v4_remainder) = v4_peer_bytes.as_chunks::<6>();
+            let (v6_chunks, v6_remainder) = v6_peer_bytes.as_chunks::<18>();
+
+            if !(v4_remainder.is_empty() && v6_remainder.is_empty()) {
+                return None;
+            }
+
+            Some(
+                v4_chunks
+                    .iter()
+                    .map(|&addr_bytes| {
+                        (
+                            IpAddr::from(<[u8; 4]>::try_from(&addr_bytes[0..4]).unwrap()),
+                            u16::from_be_bytes(addr_bytes[4..].try_into().unwrap()),
+                        )
+                    })
+                    .chain(v6_chunks.iter().map(|&addr_bytes| {
+                        (
+                            IpAddr::from(<[u8; 16]>::try_from(&addr_bytes[0..16]).unwrap()),
+                            u16::from_be_bytes(addr_bytes[16..].try_into().unwrap()),
+                        )
+                    }))
+                    .map(SocketAddr::from)
+                    .collect(),
+            )
+        }
+        // non-compact mode
+        (Bencode::List(peer_list), _) => peer_list
+            .into_iter()
+            .map(|peer| {
+                let mut peer_dict = peer.dict()?;
+
+                let ip = peer_dict
+                    .remove(b"ip" as &[u8])
+                    .and_then(|val| val.byte_string())
+                    .and_then(|bytes| String::from_utf8_lossy(&bytes).parse().ok())?;
+
+                let port = peer_dict
+                    .remove(b"port" as &[u8])
+                    .and_then(|val| val.number())
+                    .and_then(|num| u16::try_from(num).ok())?;
+
+                Some(SocketAddr::new(ip, port))
+            })
+            .collect(),
+        _ => None,
+    }
 }
