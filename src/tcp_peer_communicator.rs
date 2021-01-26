@@ -1,11 +1,11 @@
-use super::types::{Message, PeerCommunicator};
+use super::types::{Block, BlockMeta, Message, PeerCommunicator};
 use async_trait::async_trait;
 use bitvec::prelude::*;
 use snafu::{ensure, Snafu};
 use std::io;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::{TcpStream, ToSocketAddrs},
+    net::TcpStream,
 };
 
 pub struct TcpPeerCommunicator {
@@ -13,20 +13,20 @@ pub struct TcpPeerCommunicator {
 }
 
 impl TcpPeerCommunicator {
-    pub async fn new<A: ToSocketAddrs>(
-        addr: A,
+    pub async fn new(
+        tcp_stream: TcpStream,
         info_hash: &[u8],
         peer_id: &[u8],
     ) -> Result<Self, TcpPeerError> {
-        let mut stream = BufStream::new(TcpStream::connect(addr).await?);
-
         log::debug!(
-            "Opened TcpStream for address: {}",
-            stream.get_ref().peer_addr().unwrap()
+            "Opened TcpPeerCommunicator for address: {}",
+            tcp_stream.peer_addr().unwrap()
         );
 
+        let mut tcp_stream = BufStream::new(tcp_stream);
+
         // Send handshake
-        stream
+        tcp_stream
             .write_all(
                 &[
                     // 0x13 is 19 in decimal, which is the pstrlen. The next eight bytes
@@ -40,14 +40,14 @@ impl TcpPeerCommunicator {
             )
             .await?;
 
-        stream.flush().await?;
+        tcp_stream.flush().await?;
 
         log::debug!("Sent handshake to peer");
 
         let mut buf = vec![0; 68];
 
         // Recieve handshake
-        stream.read_exact(&mut buf).await?;
+        tcp_stream.read_exact(&mut buf).await?;
 
         log::debug!(
             "Recieved handshake reply from peer: {:?}",
@@ -56,7 +56,7 @@ impl TcpPeerCommunicator {
 
         ensure!(&buf[28..48] == info_hash, HandshakeInfoHash);
 
-        Ok(TcpPeerCommunicator { stream })
+        Ok(TcpPeerCommunicator { stream: tcp_stream })
     }
 }
 
@@ -102,41 +102,42 @@ impl PeerCommunicator for TcpPeerCommunicator {
             6 | 8 => {
                 ensure!(len == 13, InvalidMessageLen { len, id });
 
-                let index = self.stream.read_u32().await?;
+                let piece_index = self.stream.read_u32().await?;
                 let begin = self.stream.read_u32().await?;
                 let length = self.stream.read_u32().await?;
 
+                let block_meta = BlockMeta {
+                    piece_index,
+                    begin,
+                    length,
+                };
+
                 if id == 6 {
-                    Request {
-                        index,
-                        begin,
-                        length,
-                    }
+                    Request(block_meta)
                 } else {
-                    Cancel {
-                        index,
-                        begin,
-                        length,
-                    }
+                    Cancel(block_meta)
                 }
             }
             7 => {
                 ensure!(len >= 9, InvalidMessageLen { len, id });
 
-                let index = self.stream.read_u32().await?;
+                let piece_index = self.stream.read_u32().await?;
                 let begin = self.stream.read_u32().await?;
 
                 // TODO: reuse buffers across read calls?
                 // maybe store it in the struct itself?
-                let mut block = vec![0; (len - 9) as usize];
+                let mut data = vec![0; (len - 9) as usize];
 
-                self.stream.read_exact(&mut block).await?;
+                self.stream.read_exact(&mut data).await?;
 
-                Piece {
-                    index,
-                    begin,
-                    block,
-                }
+                Piece(Block {
+                    meta: BlockMeta {
+                        piece_index,
+                        begin,
+                        length: data.len() as u32,
+                    },
+                    data,
+                })
             }
             id => InvalidMessage { id }.fail()?,
         }))
@@ -152,35 +153,41 @@ impl PeerCommunicator for TcpPeerCommunicator {
             NotInterested => (3, vec![]),
             Have { piece_index } => (4, piece_index.to_be_bytes().to_vec()),
             BitField { bitfield } => (5, bitfield.into_vec()),
-            Request {
-                index,
+            Request(BlockMeta {
+                piece_index,
                 begin,
                 length,
-            }
-            | Cancel {
-                index,
+            })
+            | Cancel(BlockMeta {
+                piece_index,
                 begin,
                 length,
-            } => (
+            }) => (
                 if let Request { .. } = message { 6 } else { 8 },
                 [
-                    index.to_be_bytes(),
+                    piece_index.to_be_bytes(),
                     begin.to_be_bytes(),
                     length.to_be_bytes(),
                 ]
                 .concat(),
             ),
-            Piece {
-                index,
-                begin,
-                block,
-            } => (
+            Piece(Block {
+                meta: BlockMeta {
+                    piece_index, begin, ..
+                },
+                data,
+            }) => (
                 7,
-                [&index.to_be_bytes() as &[u8], &begin.to_be_bytes(), &block].concat(),
+                [
+                    &piece_index.to_be_bytes() as &[u8],
+                    &begin.to_be_bytes(),
+                    &data,
+                ]
+                .concat(),
             ),
         };
 
-        self.stream.write_u32(payload.len() as u32 + 1).await?;
+        self.stream.write_u32(payload.len() as u32 + 1u32).await?;
         self.stream.write_u8(id).await?;
         self.stream.write_all(&payload).await?;
 
