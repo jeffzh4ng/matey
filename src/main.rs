@@ -9,18 +9,21 @@ mod types;
 use bitvec::prelude::*;
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
+    borrow::Cow,
     cmp,
     collections::BTreeMap,
     convert::TryFrom,
-    env, error, fs, mem,
+    env, error, mem,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering::*},
         Arc,
     },
+    io::SeekFrom,
     time::Duration,
 };
 use tcp_peer_communicator::create_tcp_peer_rw;
-use tokio::{self, net::TcpStream, task, time};
+use tokio::{self, net::TcpStream, io::{AsyncWriteExt, AsyncSeekExt}, task, time};
 use torrent_parser::Torrent;
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
@@ -28,7 +31,7 @@ use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
 const PORT: u16 = 6881;
 const KIB: u32 = 1024;
 const BLOCK_SIZE: u32 = 16 * KIB;
-const MAX_PEERS: usize = 1;
+const MAX_PEERS: usize = 20;
 const PIPELINE_AMOUNT: usize = 5;
 
 #[tokio::main]
@@ -36,12 +39,16 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     env_logger::init();
 
     // Reading torrent file
-    let torrent_bytes = fs::read(
+    let torrent_bytes = std::fs::read(
         env::args()
             .nth(1)
             .ok_or("Didn't find a torrent file in the first argument")?,
     )?;
-    let torrent = Torrent::try_from(torrent_bytes)?;
+    let torrent = Torrent::try_from(torrent_bytes).map_err(|e| {
+        log::error!("Torrent parsing error: {:?}", e);
+
+        "Invalid or unsupported torrent file format"
+    })?;
     log::info!("Parsed torrent file");
 
     // Tracker networking
@@ -57,7 +64,34 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     // TODO: reannounce to the tracker
 
+    let root_path = Path::new(&torrent.info.name);
+    let file_handles = torrent
+        .info
+        .files
+        .iter()
+        .map(|file| {
+            let file_path = if torrent.info.files.len() == 1 {
+                Cow::from(&file.path)
+            } else {
+                root_path.join(&file.path).into()
+            };
+
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Using tokio's File::create directly here would be annoying
+            // because we'd have to deal with the iterator's Items being Futures
+            // instead of actual File values.
+            let file_handle = std::fs::File::create(file_path)?;
+            file_handle.set_len(file.length)?;
+
+            Ok(tokio::fs::File::from_std(file_handle))
+        })
+        .collect::<Result<_, std::io::Error>>()?;
+
     // Shared structures for worker threads
+    let torrent = Arc::new(torrent);
     let bitfield_pieces = Arc::new(tokio::sync::RwLock::new(
         bitvec![Msb0, u8; false as u8; torrent.info.pieces.len()],
     ));
@@ -66,6 +100,23 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     )));
     let (blocks_tx, mut blocks_rx) = tokio::sync::mpsc::unbounded_channel::<Block>();
     let (pieces_tx, mut pieces_rx) = tokio::sync::broadcast::channel::<u32>(10);
+
+    let pieces_tx_clone = pieces_tx.clone();
+    let torrent_clone = torrent.clone();
+
+    let io_task_handle = task::spawn(async move {
+        let result = store_blocks(
+            &torrent_clone,
+            file_handles,
+            &mut blocks_rx,
+            &pieces_tx_clone,
+        )
+        .await;
+
+        if let Err(e) = result {
+            log::error!("Error while writing to files: {:?}", e);
+        }
+    });
 
     let mut num_peers = 0;
 
@@ -87,7 +138,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                 let blocks_tx = blocks_tx.clone();
 
                 task::spawn(async move {
-                    peer_connection(
+                    let result = peer_connection(
                         num_peers,
                         &worker_queue,
                         &bitfield_pieces,
@@ -95,12 +146,39 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                         &mut pieces_rx,
                         peer,
                     )
-                    .await
+                    .await;
+
+                    if let Err(e) = result {
+                        log::error!("[{}]: Done with error: {:?}", num_peers, e);
+                    }
                 });
             }
         }
 
         pieces_rx = pieces_tx.subscribe();
+    }
+    
+    io_task_handle.await?;
+    
+    Ok(())
+}
+
+async fn store_blocks(
+    torrent: &Torrent,
+    mut file_handles: Vec<tokio::fs::File>,
+    blocks_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Block>,
+    pieces_tx: &tokio::sync::broadcast::Sender<u32>,
+) -> Result<(), std::io::Error> {
+    assert!(torrent.info.files.len() == 1, "Multi-file torrents not yet supported");
+
+    while let Some(block) = blocks_rx.recv().await {
+        // TODO: SHA-1 verification of a complete piece + notify peers
+        log::debug!("Writing block {:?}", block.meta);
+
+        let offset = (block.meta.piece_index as u64 * torrent.info.piece_len) + block.meta.begin as u64;
+
+        file_handles[0].seek(SeekFrom::Start(offset)).await?;
+        file_handles[0].write_all(&block.data).await?;
     }
 
     Ok(())

@@ -12,7 +12,7 @@ snafu = { version = "0.6", default-features = false, features = ["std"] }
 sha-1 = "0.9"
 percent-encoding = "2.1"
 reqwest = "0.11"
-tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "net", "macros", "parking_lot"] }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "net", "fs", "macros", "parking_lot"] }
 async-trait = "0.1"
 rand = "0.8"
 log = "0.4"
