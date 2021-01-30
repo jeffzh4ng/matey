@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bitvec::prelude::*;
+use bytes::Bytes;
 use std::{error, fmt};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -22,7 +23,7 @@ impl fmt::Debug for BlockMeta {
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Block {
     pub meta: BlockMeta,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 impl fmt::Debug for Block {

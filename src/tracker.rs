@@ -1,5 +1,6 @@
 use super::bencode_parser::{parse_bencode, Bencode};
 use super::torrent_parser::Torrent;
+use bytes::Bytes;
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::{distributions, thread_rng, Rng};
 use reqwest::Url;
@@ -78,8 +79,8 @@ pub fn build_peerlist(response: &[u8]) -> Option<Vec<SocketAddr>> {
     }
 
     match (
-        peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
-        v6_peers.unwrap_or_else(|| Bencode::ByteString(vec![])),
+        peers.unwrap_or_else(|| Bencode::ByteString(Bytes::new())),
+        v6_peers.unwrap_or_else(|| Bencode::ByteString(Bytes::new())),
     ) {
         // compact mode
         (Bencode::ByteString(v4_peer_bytes), Bencode::ByteString(v6_peer_bytes)) => {

@@ -10,7 +10,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt, num,
     path::PathBuf,
-    string,
+    str,
 };
 
 #[derive(Clone, Debug)]
@@ -20,11 +20,11 @@ pub struct Torrent {
     pub info_hash: SHA1Hash,
 }
 
-impl TryFrom<Vec<u8>> for Torrent {
+impl TryFrom<&[u8]> for Torrent {
     type Error = TorrentParsingError;
 
-    fn try_from(torrent_bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        let mut torrent_dict = parse_bencode(&torrent_bytes)
+    fn try_from(torrent_bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut torrent_dict = parse_bencode(torrent_bytes)
             .map_err(|_| TorrentParsingError::InvalidBencode)
             .and_then(|(_, bencode)| bencode.dict().context(NotADict))?;
 
@@ -32,7 +32,11 @@ impl TryFrom<Vec<u8>> for Torrent {
             .remove(b"announce" as &[u8])
             .and_then(|val| val.byte_string())
             .context(FieldNotFound { field: "announce" })
-            .and_then(|val| String::from_utf8(val).context(InvalidString))?;
+            .and_then(|val| {
+                str::from_utf8(&val)
+                    .context(InvalidString)
+                    .map(|s| s.to_owned())
+            })?;
 
         let info = torrent_dict
             .remove(b"info" as &[u8])
@@ -78,7 +82,11 @@ impl TryFrom<Bencode> for TorrentInfo {
             .context(FieldNotFound {
                 field: "info[name]",
             })
-            .and_then(|val| String::from_utf8(val).context(InvalidString))?;
+            .and_then(|val| {
+                str::from_utf8(&val)
+                    .context(InvalidString)
+                    .map(|s| s.to_owned())
+            })?;
 
         let files = if let Some(multiple_files) = torrent_info_dict
             .remove(b"files" as &[u8])
@@ -159,7 +167,9 @@ impl TryFrom<Bencode> for TorrentFile {
             })?
             .into_iter()
             .map(|val| {
-                String::from_utf8(val.byte_string().context(InvalidPath)?).context(InvalidString)
+                str::from_utf8(&val.byte_string().context(InvalidPath)?)
+                    .context(InvalidString)
+                    .map(|s| s.to_owned())
             })
             .collect::<Result<_, _>>()?;
 
@@ -192,7 +202,7 @@ pub enum TorrentParsingError {
     #[snafu(display("Expected a dictionary, but didn't find it"))]
     NotADict,
     #[snafu(display("Attempted to decode an invalid string"))]
-    InvalidString { source: string::FromUtf8Error },
+    InvalidString { source: str::Utf8Error },
     #[snafu(display("Couldn't find field {}", field))]
     FieldNotFound { field: String },
     #[snafu(display("Invalid piece length"))]

@@ -13,17 +13,23 @@ use std::{
     cmp,
     collections::BTreeMap,
     convert::TryFrom,
-    env, error, mem,
+    env, error,
+    io::SeekFrom,
+    mem,
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering::*},
         Arc,
     },
-    io::SeekFrom,
     time::Duration,
 };
 use tcp_peer_communicator::create_tcp_peer_rw;
-use tokio::{self, net::TcpStream, io::{AsyncWriteExt, AsyncSeekExt}, task, time};
+use tokio::{
+    self,
+    io::{AsyncSeekExt, AsyncWriteExt},
+    net::TcpStream,
+    task, time,
+};
 use torrent_parser::Torrent;
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
@@ -44,7 +50,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             .nth(1)
             .ok_or("Didn't find a torrent file in the first argument")?,
     )?;
-    let torrent = Torrent::try_from(torrent_bytes).map_err(|e| {
+    let torrent = Torrent::try_from(torrent_bytes.as_slice()).map_err(|e| {
         log::error!("Torrent parsing error: {:?}", e);
 
         "Invalid or unsupported torrent file format"
@@ -157,9 +163,9 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
         pieces_rx = pieces_tx.subscribe();
     }
-    
+
     io_task_handle.await?;
-    
+
     Ok(())
 }
 
@@ -169,13 +175,17 @@ async fn store_blocks(
     blocks_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Block>,
     pieces_tx: &tokio::sync::broadcast::Sender<u32>,
 ) -> Result<(), std::io::Error> {
-    assert!(torrent.info.files.len() == 1, "Multi-file torrents not yet supported");
+    assert!(
+        torrent.info.files.len() == 1,
+        "Multi-file torrents not yet supported"
+    );
 
     while let Some(block) = blocks_rx.recv().await {
         // TODO: SHA-1 verification of a complete piece + notify peers
         log::debug!("Writing block {:?}", block.meta);
 
-        let offset = (block.meta.piece_index as u64 * torrent.info.piece_len) + block.meta.begin as u64;
+        let offset =
+            (block.meta.piece_index as u64 * torrent.info.piece_len) + block.meta.begin as u64;
 
         file_handles[0].seek(SeekFrom::Start(offset)).await?;
         file_handles[0].write_all(&block.data).await?;

@@ -1,6 +1,7 @@
 use super::types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
 use async_trait::async_trait;
 use bitvec::prelude::*;
+use bytes::BytesMut;
 use snafu::{ensure, Snafu};
 use std::io;
 use tokio::{
@@ -116,7 +117,9 @@ impl PeerReader for TcpPeerReader {
                 let piece_index = self.reader.read_u32().await?;
                 let begin = self.reader.read_u32().await?;
 
-                let mut data = vec![0; (len - 9) as usize];
+                let mut data = BytesMut::new();
+
+                data.resize(len as usize - 9, Default::default());
 
                 self.reader.read_exact(&mut data).await?;
 
@@ -126,7 +129,7 @@ impl PeerReader for TcpPeerReader {
                         begin,
                         length: data.len() as u32,
                     },
-                    data,
+                    data: data.freeze(),
                 })
             }
             id => InvalidMessage { id }.fail()?,
