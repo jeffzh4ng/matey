@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let worker_queue = Arc::new(tokio::sync::RwLock::new(construct_worker_queue(
         &torrent, BLOCK_SIZE,
     )));
-    let (blocks_tx, mut blocks_rx) = tokio::sync::mpsc::unbounded_channel::<Block>();
+    let (blocks_tx, mut blocks_rx) = tokio::sync::mpsc::channel::<Block>(50);
     let (pieces_tx, mut pieces_rx) = tokio::sync::broadcast::channel::<u32>(10);
 
     let pieces_tx_clone = pieces_tx.clone();
@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 async fn store_blocks(
     torrent: &Torrent,
     mut file_handles: Vec<tokio::fs::File>,
-    blocks_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Block>,
+    blocks_rx: &mut tokio::sync::mpsc::Receiver<Block>,
     pieces_tx: &tokio::sync::broadcast::Sender<u32>,
 ) -> Result<(), std::io::Error> {
     assert!(
@@ -189,6 +189,7 @@ async fn store_blocks(
 
         file_handles[0].seek(SeekFrom::Start(offset)).await?;
         file_handles[0].write_all(&block.data).await?;
+        file_handles[0].sync_data().await?;
     }
 
     Ok(())
@@ -198,7 +199,7 @@ async fn peer_connection<R: PeerReader, W: PeerWriter>(
     peer_num: usize,
     worker_queue: &tokio::sync::RwLock<WorkerQueue>,
     bitfield_pieces: &tokio::sync::RwLock<BitVec<Msb0, u8>>,
-    blocks_tx: &tokio::sync::mpsc::UnboundedSender<Block>,
+    blocks_tx: &tokio::sync::mpsc::Sender<Block>,
     pieces_rx: &mut tokio::sync::broadcast::Receiver<u32>,
     (mut peer_reader, mut peer_writer): (R, W),
 ) -> Result<(), PeerConnectionError<R::Error, W::Error>>
@@ -276,7 +277,7 @@ where
                             // without us having to actually hold onto it.
                             mem::forget(block_queue_write.remove(idx));
 
-                            blocks_tx.send(block).context(BlockSendError)?;
+                            blocks_tx.send(block).await.context(BlockSendError)?;
                         } else {
                             log::error!(
                                 "[{}]: Recieved block we don't have a lock on: {:?}",
@@ -328,6 +329,7 @@ where
                 if (time::Instant::now() - last_keepalive_instant) > Duration::from_secs(120)
                     && !sent_message
                 {
+                    log::info!("Sending keepalive");
                     peer_writer.write(KeepAlive).await.context(WriteError)?;
 
                     // We need to send this as soon as possible or we risk
