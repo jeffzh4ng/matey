@@ -251,7 +251,9 @@ where
                     BitField(mut bitfield) => {
                         let mut peer_pieces = peer_pieces.lock().await;
 
-                        ensure!(bitfield.len() == peer_pieces.len(), InvalidBitfield);
+                        ensure!(bitfield.len() >= peer_pieces.len(), InvalidBitfield);
+
+                        bitfield.truncate(peer_pieces.len());
                         peer_pieces.swap_with_bitslice(&mut bitfield)
                     }
                     Request(block_meta) => { /* TODO no panic */ }
