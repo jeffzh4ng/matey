@@ -214,10 +214,7 @@ where
     let peer_choked = AtomicBool::new(true);
     let peer_interested = AtomicBool::new(false);
 
-    let block_queue = tokio::sync::RwLock::new(Vec::<(
-        tokio::sync::OwnedMutexGuard<BlockMeta>,
-        AtomicBool,
-    )>::with_capacity(PIPELINE_AMOUNT));
+    let block_queue = tokio::sync::RwLock::new(Vec::<BlockWork>::with_capacity(PIPELINE_AMOUNT));
 
     use Message::*;
 
@@ -259,13 +256,13 @@ where
                     }
                     Request(block_meta) => { /* TODO no panic */ }
                     Cancel(block_meta) => { /* TODO no panic */ }
-                    Piece(block) => {
+                    Piece(received_block) => {
                         let block_queue_read = block_queue.read().await;
 
                         if let Some(idx) =
-                            block_queue_read.iter().position(|(b, _)| **b == block.meta)
+                            block_queue_read.iter().position(|BlockWork { block_meta, .. }| **block_meta == received_block.meta)
                         {
-                            log::debug!("[{}]: Recieved block {:?}", peer_num, block.meta);
+                            log::debug!("[{}]: Recieved block {:?}", peer_num, received_block.meta);
 
                             drop(block_queue_read);
 
@@ -277,12 +274,12 @@ where
                             // without us having to actually hold onto it.
                             mem::forget(block_queue_write.remove(idx));
 
-                            blocks_tx.send(block).await.context(BlockSendError)?;
+                            blocks_tx.send(received_block).await.context(BlockSendError)?;
                         } else {
                             log::error!(
                                 "[{}]: Recieved block we don't have a lock on: {:?}",
                                 peer_num,
-                                block.meta
+                                received_block.meta
                             );
                         }
                     }
@@ -358,7 +355,7 @@ where
 
                 // TODO: keep track of if a request has been unfulfilled for too long
                 if !am_choked.load(Acquire) {
-                    for (block_meta, requested) in block_queue_read.iter() {
+                    for BlockWork { block_meta, requested, .. } in block_queue_read.iter() {
                         if !requested.load(Acquire) {
                             log::debug!("[{}]: Requesting {:?}", peer_num, block_meta);
 
@@ -406,7 +403,7 @@ enum PeerConnectionError<R: error::Error + 'static, W: error::Error + 'static> {
 }
 
 fn get_available_blocks(
-    blocks: &mut Vec<(tokio::sync::OwnedMutexGuard<BlockMeta>, AtomicBool)>,
+    blocks: &mut Vec<BlockWork>,
     worker_queue: &WorkerQueue,
     mut peer_has_piece: impl FnMut(u32) -> bool,
     max: usize,
@@ -423,13 +420,30 @@ fn get_available_blocks(
         for block_lock in &piece_work_info.blocks {
             if let Ok(block_meta) = block_lock.clone().try_lock_owned() {
                 piece_work_info.available_blocks.fetch_sub(1, AcqRel);
-                blocks.push((block_meta, AtomicBool::new(false)));
+
+                blocks.push(BlockWork {
+                    block_meta,
+                    requested: AtomicBool::new(false),
+                    piece_available_blocks: piece_work_info.available_blocks.clone(),
+                });
 
                 if blocks.len() == max {
                     return;
                 }
             }
         }
+    }
+}
+
+struct BlockWork {
+    block_meta: tokio::sync::OwnedMutexGuard<BlockMeta>,
+    requested: AtomicBool,
+    piece_available_blocks: Arc<AtomicU32>,
+}
+
+impl Drop for BlockWork {
+    fn drop(&mut self) {
+        self.piece_available_blocks.fetch_add(1, AcqRel);
     }
 }
 
@@ -444,8 +458,7 @@ struct PieceKey {
 #[derive(Debug)]
 struct PieceWorkInfo {
     blocks: Vec<Arc<tokio::sync::Mutex<BlockMeta>>>,
-    // TODO: See if it makes sense to replace this with a Semaphore
-    available_blocks: AtomicU32,
+    available_blocks: Arc<AtomicU32>,
 }
 
 fn construct_worker_queue(torrent: &Torrent, block_len: u32) -> WorkerQueue {
@@ -469,7 +482,7 @@ fn construct_worker_queue(torrent: &Torrent, block_len: u32) -> WorkerQueue {
                     piece_index,
                 },
                 PieceWorkInfo {
-                    available_blocks: AtomicU32::new(num_blocks),
+                    available_blocks: Arc::new(AtomicU32::new(num_blocks)),
                     blocks: (0..num_blocks)
                         .map(|block_index| {
                             let this_block_len = cmp::min(left_piece_len, block_len as u64) as u32;
