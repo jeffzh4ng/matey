@@ -235,7 +235,12 @@ where
 
                 match message {
                     KeepAlive => continue,
-                    Choke => am_choked.store(true, Release),
+                    Choke => {
+                        am_choked.store(true, Release);
+
+                        // Unfulfilled requests should be considered dropped when choked.
+                        block_queue.write().await.retain(|BlockWork { requested, .. }| !requested.load(Acquire));
+                    }
                     Unchoke => am_choked.store(false, Release),
                     Interested => peer_interested.store(true, Release),
                     NotInterested => peer_interested.store(false, Release),
