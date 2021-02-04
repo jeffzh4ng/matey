@@ -178,7 +178,7 @@ impl TryFrom<Bencode> for TorrentFile {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SHA1Hash([u8; 20]);
+pub struct SHA1Hash(pub [u8; 20]);
 
 impl AsRef<[u8; 20]> for SHA1Hash {
     fn as_ref(&self) -> &[u8; 20] {

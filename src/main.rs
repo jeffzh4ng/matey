@@ -1,4 +1,4 @@
-#![feature(slice_as_chunks)]
+#![feature(slice_as_chunks, with_options)]
 
 mod bencode_parser;
 mod tcp_peer_communicator;
@@ -9,10 +9,10 @@ mod types;
 use bitvec::prelude::*;
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
-    borrow::Cow,
+    borrow::{Cow, Borrow},
     cmp,
     collections::BTreeMap,
-    convert::TryFrom,
+    convert::{TryFrom, TryInto},
     env, error,
     io::SeekFrom,
     mem,
@@ -26,13 +26,17 @@ use std::{
 use tcp_peer_communicator::create_tcp_peer_rw;
 use tokio::{
     self,
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt},
     net::TcpStream,
     task, time,
 };
-use torrent_parser::Torrent;
+use torrent_parser::{Torrent, SHA1Hash};
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
+use sha1::{Digest, Sha1};
+use indicatif::{ProgressBar, ProgressStyle};
+use bytes::BytesMut;
+use rand::{prelude::*, distributions::Bernoulli};
 
 const PORT: u16 = 6881;
 const KIB: u32 = 1024;
@@ -89,7 +93,12 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             // Using tokio's File::create directly here would be annoying
             // because we'd have to deal with the iterator's Items being Futures
             // instead of actual File values.
-            let file_handle = std::fs::File::create(file_path)?;
+            let file_handle = std::fs::File::with_options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(file_path)?;
+
             file_handle.set_len(file.length)?;
 
             Ok(tokio::fs::File::from_std(file_handle))
@@ -105,12 +114,12 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         &torrent, BLOCK_SIZE,
     )));
     let (blocks_tx, mut blocks_rx) = tokio::sync::mpsc::channel::<Block>(50);
-    let (pieces_tx, mut pieces_rx) = tokio::sync::broadcast::channel::<u32>(10);
+    let (pieces_tx, mut pieces_rx) = tokio::sync::broadcast::channel::<(u32, usize)>(10);
 
     let pieces_tx_clone = pieces_tx.clone();
     let torrent_clone = torrent.clone();
 
-    let io_task_handle = task::spawn(async move {
+    task::spawn(async move {
         let result = store_blocks(
             &torrent_clone,
             file_handles,
@@ -120,7 +129,33 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         .await;
 
         if let Err(e) = result {
-            log::error!("Error while writing to files: {:?}", e);
+            log::error!("Error while doing disk I/O: {:?}", e);
+        }
+    });
+
+    let pb = ProgressBar::new(torrent.info.files.iter().map(|f| f.length).sum());
+
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed}] {percent}% [{bar:100.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) (ETA: {eta})")
+        .progress_chars("#>-"));
+
+    pb.enable_steady_tick(50);
+
+    let bitfield_pieces_clone = bitfield_pieces.clone();
+    let worker_queue_clone = worker_queue.clone();
+
+    let progress_task_handle = task::spawn(async move {
+        while let Ok((piece_index, piece_len)) = pieces_rx.recv().await {
+            pb.inc(piece_len as u64);
+
+            *bitfield_pieces_clone.write().await.get_mut(piece_index as usize).unwrap() = true;
+
+            let mut worker_queue = worker_queue_clone.write().await;
+            worker_queue.remove(&piece_index);
+
+            if worker_queue.downgrade().is_empty() {
+                break;
+            }
         }
     });
 
@@ -142,6 +177,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                 let worker_queue = worker_queue.clone();
                 let bitfield_pieces = bitfield_pieces.clone();
                 let blocks_tx = blocks_tx.clone();
+                pieces_rx = pieces_tx.subscribe();
 
                 task::spawn(async move {
                     let result = peer_connection(
@@ -155,16 +191,14 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                     .await;
 
                     if let Err(e) = result {
-                        log::error!("[{}]: Done with error: {:?}", num_peers, e);
+                        log::warn!("[{}]: Done with error: {:?}", num_peers, e);
                     }
                 });
             }
         }
-
-        pieces_rx = pieces_tx.subscribe();
     }
 
-    io_task_handle.await?;
+    progress_task_handle.await?;
 
     Ok(())
 }
@@ -173,23 +207,42 @@ async fn store_blocks(
     torrent: &Torrent,
     mut file_handles: Vec<tokio::fs::File>,
     blocks_rx: &mut tokio::sync::mpsc::Receiver<Block>,
-    pieces_tx: &tokio::sync::broadcast::Sender<u32>,
+    pieces_tx: &tokio::sync::broadcast::Sender<(u32, usize)>,
 ) -> Result<(), std::io::Error> {
     assert!(
         torrent.info.files.len() == 1,
         "Multi-file torrents not yet supported"
     );
 
+    let mut buf = BytesMut::with_capacity(torrent.info.piece_len as usize);
+
     while let Some(block) = blocks_rx.recv().await {
-        // TODO: SHA-1 verification of a complete piece + notify peers
         log::debug!("Writing block {:?}", block.meta);
 
-        let offset =
-            (block.meta.piece_index as u64 * torrent.info.piece_len) + block.meta.begin as u64;
+        let piece_offset =
+            block.meta.piece_index as u64 * torrent.info.piece_len;
 
-        file_handles[0].seek(SeekFrom::Start(offset)).await?;
+        file_handles[0].seek(SeekFrom::Start(piece_offset + block.meta.begin as u64)).await?;
         file_handles[0].write_all(&block.data).await?;
         file_handles[0].sync_data().await?;
+
+        file_handles[0].seek(SeekFrom::Start(piece_offset)).await?;
+
+        buf.clear();
+
+        while file_handles[0].read_buf(&mut buf).await? > 0 {
+            if buf.len() == torrent.info.piece_len as usize {
+                break;
+            }
+        }
+
+        if SHA1Hash(Sha1::digest(&buf).try_into().unwrap()) == torrent.info.pieces[block.meta.piece_index as usize] {
+            log::debug!("Wrote complete piece {}", block.meta.piece_index);
+
+            // We don't really care if this is failed to send right now, the
+            // docs say that this doesn't mean future calls to send will fail.
+            let _ = pieces_tx.send((block.meta.piece_index, buf.len()));
+        }
     }
 
     Ok(())
@@ -200,7 +253,7 @@ async fn peer_connection<R: PeerReader, W: PeerWriter>(
     worker_queue: &tokio::sync::RwLock<WorkerQueue>,
     bitfield_pieces: &tokio::sync::RwLock<BitVec<Msb0, u8>>,
     blocks_tx: &tokio::sync::mpsc::Sender<Block>,
-    pieces_rx: &mut tokio::sync::broadcast::Receiver<u32>,
+    pieces_rx: &mut tokio::sync::broadcast::Receiver<(u32, usize)>,
     (mut peer_reader, mut peer_writer): (R, W),
 ) -> Result<(), PeerConnectionError<R::Error, W::Error>>
 where
@@ -215,6 +268,10 @@ where
     let peer_interested = AtomicBool::new(false);
 
     let block_queue = tokio::sync::RwLock::new(Vec::<BlockWork>::with_capacity(PIPELINE_AMOUNT));
+
+    // Unwrap is infallible here because from_ratio only errors when numerator >
+    // denominiator or denominator == 0.
+    let have_rate = Bernoulli::from_ratio(1, 5).unwrap();
 
     use Message::*;
 
@@ -281,7 +338,7 @@ where
 
                             blocks_tx.send(received_block).await.context(BlockSendError)?;
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "[{}]: Recieved block we don't have a lock on: {:?}",
                                 peer_num,
                                 received_block.meta
@@ -297,11 +354,25 @@ where
         async {
             log::debug!("[{}]: Peer write task started", peer_num);
 
+            let mut need_send_bitfield = true;
             let mut am_interested = false;
             let mut sent_message = false;
             let mut last_keepalive_instant = time::Instant::now();
 
             loop {
+                if need_send_bitfield {
+                    let bitfield = bitfield_pieces.read().await;
+
+                    if bitfield.iter().by_ref().any(|&have_piece| have_piece) {
+                        log::debug!("[{}]: Sending bitfield", peer_num);
+
+                        peer_writer.write(BitField(bitfield.clone())).await
+                            .context(WriteError)?;
+                    }
+
+                    need_send_bitfield = false;
+                }
+
                 let mut block_queue_write = block_queue.write().await;
 
                 if block_queue_write.len() < PIPELINE_AMOUNT {
@@ -331,7 +402,8 @@ where
                 if (time::Instant::now() - last_keepalive_instant) > Duration::from_secs(120)
                     && !sent_message
                 {
-                    log::info!("Sending keepalive");
+                    log::debug!("[{}]: Sending keepalive", peer_num);
+
                     peer_writer.write(KeepAlive).await.context(WriteError)?;
 
                     // We need to send this as soon as possible or we risk
@@ -349,13 +421,25 @@ where
                     sent_message = true;
                 }
 
-                if let Ok(piece_index) = pieces_rx.try_recv() {
-                    peer_writer
-                        .write(Have(piece_index))
-                        .await
-                        .context(WriteError)?;
+                if let Ok((piece_index, _)) = pieces_rx.try_recv() {
+                    let peer_has_piece =
+                        peer_pieces.lock().await.get(piece_index as usize).as_deref() == Some(&true);
 
-                    sent_message = true;
+                    // A peer is extremely unlikely to want to download a piece
+                    // they already have, so supressing HAVE messages in that
+                    // case reduces overhead. However, it does help the swarm
+                    // determine pieces that are rare, so I chose to have it be
+                    // based on random chance.
+                    if !peer_has_piece || have_rate.sample(&mut rand::thread_rng()) {
+                        log::debug!("[{}]: Sending HAVE {}", peer_num, piece_index);
+
+                        peer_writer
+                            .write(Have(piece_index))
+                            .await
+                            .context(WriteError)?;
+
+                        sent_message = true;
+                    }
                 }
 
                 // TODO: keep track of if a request has been unfulfilled for too long
@@ -456,8 +540,14 @@ type WorkerQueue = BTreeMap<PieceKey, PieceWorkInfo>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct PieceKey {
-    priority: usize,
+    // TODO: find a way to cleanly implement priority
     piece_index: u32,
+}
+
+impl Borrow<u32> for PieceKey {
+    fn borrow(&self) -> &u32 {
+        &self.piece_index
+    }
 }
 
 #[derive(Debug)]
@@ -483,7 +573,6 @@ fn construct_worker_queue(torrent: &Torrent, block_len: u32) -> WorkerQueue {
 
             (
                 PieceKey {
-                    priority: 0,
                     piece_index,
                 },
                 PieceWorkInfo {
