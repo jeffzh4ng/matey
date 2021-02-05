@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let pb = ProgressBar::new(torrent.info.files.iter().map(|f| f.length).sum());
 
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed}] {percent}% [{bar:100.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) (ETA: {eta})")
+        .template("{spinner:.green} [{elapsed}] {percent}% [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) (ETA: {eta})")
         .progress_chars("#>-"));
 
     pb.enable_steady_tick(50);
