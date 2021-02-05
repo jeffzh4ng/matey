@@ -7,9 +7,13 @@ mod tracker;
 mod types;
 
 use bitvec::prelude::*;
+use bytes::BytesMut;
+use indicatif::{ProgressBar, ProgressStyle};
+use rand::{distributions::Bernoulli, prelude::*};
+use sha1::{Digest, Sha1};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
-    borrow::{Cow, Borrow},
+    borrow::{Borrow, Cow},
     cmp,
     collections::BTreeMap,
     convert::{TryFrom, TryInto},
@@ -26,17 +30,14 @@ use std::{
 use tcp_peer_communicator::create_tcp_peer_rw;
 use tokio::{
     self,
-    io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpStream,
+    sync::{broadcast, mpsc, Mutex, OwnedMutexGuard, RwLock},
     task, time,
 };
-use torrent_parser::{Torrent, SHA1Hash};
+use torrent_parser::{SHA1Hash, Torrent};
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
-use sha1::{Digest, Sha1};
-use indicatif::{ProgressBar, ProgressStyle};
-use bytes::BytesMut;
-use rand::{prelude::*, distributions::Bernoulli};
 
 const PORT: u16 = 6881;
 const KIB: u32 = 1024;
@@ -107,14 +108,12 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     // Shared structures for worker threads
     let torrent = Arc::new(torrent);
-    let bitfield_pieces = Arc::new(tokio::sync::RwLock::new(
+    let bitfield_pieces = Arc::new(RwLock::new(
         bitvec![Msb0, u8; false as u8; torrent.info.pieces.len()],
     ));
-    let worker_queue = Arc::new(tokio::sync::RwLock::new(construct_worker_queue(
-        &torrent, BLOCK_SIZE,
-    )));
-    let (blocks_tx, mut blocks_rx) = tokio::sync::mpsc::channel::<Block>(50);
-    let (pieces_tx, mut pieces_rx) = tokio::sync::broadcast::channel::<(u32, usize)>(10);
+    let worker_queue = Arc::new(RwLock::new(construct_worker_queue(&torrent, BLOCK_SIZE)));
+    let (blocks_tx, mut blocks_rx) = mpsc::channel::<Block>(50);
+    let (pieces_tx, mut pieces_rx) = broadcast::channel::<(u32, usize)>(10);
 
     let pieces_tx_clone = pieces_tx.clone();
     let torrent_clone = torrent.clone();
@@ -148,7 +147,11 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         while let Ok((piece_index, piece_len)) = pieces_rx.recv().await {
             pb.inc(piece_len as u64);
 
-            *bitfield_pieces_clone.write().await.get_mut(piece_index as usize).unwrap() = true;
+            *bitfield_pieces_clone
+                .write()
+                .await
+                .get_mut(piece_index as usize)
+                .unwrap() = true;
 
             let mut worker_queue = worker_queue_clone.write().await;
             worker_queue.remove(&piece_index);
@@ -206,8 +209,8 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 async fn store_blocks(
     torrent: &Torrent,
     mut file_handles: Vec<tokio::fs::File>,
-    blocks_rx: &mut tokio::sync::mpsc::Receiver<Block>,
-    pieces_tx: &tokio::sync::broadcast::Sender<(u32, usize)>,
+    blocks_rx: &mut mpsc::Receiver<Block>,
+    pieces_tx: &broadcast::Sender<(u32, usize)>,
 ) -> Result<(), std::io::Error> {
     assert!(
         torrent.info.files.len() == 1,
@@ -219,10 +222,11 @@ async fn store_blocks(
     while let Some(block) = blocks_rx.recv().await {
         log::debug!("Writing block {:?}", block.meta);
 
-        let piece_offset =
-            block.meta.piece_index as u64 * torrent.info.piece_len;
+        let piece_offset = block.meta.piece_index as u64 * torrent.info.piece_len;
 
-        file_handles[0].seek(SeekFrom::Start(piece_offset + block.meta.begin as u64)).await?;
+        file_handles[0]
+            .seek(SeekFrom::Start(piece_offset + block.meta.begin as u64))
+            .await?;
         file_handles[0].write_all(&block.data).await?;
         file_handles[0].sync_data().await?;
 
@@ -236,7 +240,9 @@ async fn store_blocks(
             }
         }
 
-        if SHA1Hash(Sha1::digest(&buf).try_into().unwrap()) == torrent.info.pieces[block.meta.piece_index as usize] {
+        if SHA1Hash(Sha1::digest(&buf).try_into().unwrap())
+            == torrent.info.pieces[block.meta.piece_index as usize]
+        {
             log::debug!("Wrote complete piece {}", block.meta.piece_index);
 
             // We don't really care if this is failed to send right now, the
@@ -250,10 +256,10 @@ async fn store_blocks(
 
 async fn peer_connection<R: PeerReader, W: PeerWriter>(
     peer_num: usize,
-    worker_queue: &tokio::sync::RwLock<WorkerQueue>,
-    bitfield_pieces: &tokio::sync::RwLock<BitVec<Msb0, u8>>,
-    blocks_tx: &tokio::sync::mpsc::Sender<Block>,
-    pieces_rx: &mut tokio::sync::broadcast::Receiver<(u32, usize)>,
+    worker_queue: &RwLock<WorkerQueue>,
+    bitfield_pieces: &RwLock<BitVec<Msb0, u8>>,
+    blocks_tx: &mpsc::Sender<Block>,
+    pieces_rx: &mut broadcast::Receiver<(u32, usize)>,
     (mut peer_reader, mut peer_writer): (R, W),
 ) -> Result<(), PeerConnectionError<R::Error, W::Error>>
 where
@@ -261,13 +267,12 @@ where
     W::Error: 'static,
 {
     let peer_pieces =
-        tokio::sync::Mutex::new(bitvec![Msb0, u8; false as u8; bitfield_pieces.read().await.len()]);
+        Mutex::new(bitvec![Msb0, u8; false as u8; bitfield_pieces.read().await.len()]);
 
     let am_choked = AtomicBool::new(true);
-    let peer_choked = AtomicBool::new(true);
     let peer_interested = AtomicBool::new(false);
 
-    let block_queue = tokio::sync::RwLock::new(Vec::<BlockWork>::with_capacity(PIPELINE_AMOUNT));
+    let block_queue = RwLock::new(Vec::<BlockWork>::with_capacity(PIPELINE_AMOUNT));
 
     // Unwrap is infallible here because from_ratio only errors when numerator >
     // denominiator or denominator == 0.
@@ -296,7 +301,10 @@ where
                         am_choked.store(true, Release);
 
                         // Unfulfilled requests should be considered dropped when choked.
-                        block_queue.write().await.retain(|BlockWork { requested, .. }| !requested.load(Acquire));
+                        block_queue
+                            .write()
+                            .await
+                            .retain(|BlockWork { requested, .. }| !requested.load(Acquire));
                     }
                     Unchoke => am_choked.store(false, Release),
                     Interested => peer_interested.store(true, Release),
@@ -316,13 +324,17 @@ where
                         bitfield.truncate(peer_pieces.len());
                         peer_pieces.swap_with_bitslice(&mut bitfield)
                     }
-                    Request(block_meta) => { /* TODO no panic */ }
-                    Cancel(block_meta) => { /* TODO no panic */ }
+                    Request(_block_meta) => { /* TODO no panic */ }
+                    Cancel(_block_meta) => { /* TODO no panic */ }
                     Piece(received_block) => {
                         let block_queue_read = block_queue.read().await;
 
                         if let Some(idx) =
-                            block_queue_read.iter().position(|BlockWork { block_meta, .. }| **block_meta == received_block.meta)
+                            block_queue_read
+                                .iter()
+                                .position(|BlockWork { block_meta, .. }| {
+                                    **block_meta == received_block.meta
+                                })
                         {
                             log::debug!("[{}]: Recieved block {:?}", peer_num, received_block.meta);
 
@@ -336,7 +348,10 @@ where
                             // without us having to actually hold onto it.
                             mem::forget(block_queue_write.remove(idx));
 
-                            blocks_tx.send(received_block).await.context(BlockSendError)?;
+                            blocks_tx
+                                .send(received_block)
+                                .await
+                                .context(BlockSendError)?;
                         } else {
                             log::warn!(
                                 "[{}]: Recieved block we don't have a lock on: {:?}",
@@ -366,7 +381,9 @@ where
                     if bitfield.iter().by_ref().any(|&have_piece| have_piece) {
                         log::debug!("[{}]: Sending bitfield", peer_num);
 
-                        peer_writer.write(BitField(bitfield.clone())).await
+                        peer_writer
+                            .write(BitField(bitfield.clone()))
+                            .await
                             .context(WriteError)?;
                     }
 
@@ -384,14 +401,7 @@ where
                         get_available_blocks(
                             &mut block_queue_write,
                             &worker_queue_read,
-                            |idx| {
-                                match peer_pieces_lock.get(idx as usize) {
-                                    Some(is_available) => *is_available,
-                                    // This probably should be an error, but we can't
-                                    // return it from here.
-                                    None => false,
-                                }
-                            },
+                            |idx| peer_pieces_lock.get(idx as usize).as_deref() == Some(&true),
                             PIPELINE_AMOUNT,
                         );
                     }
@@ -422,8 +432,12 @@ where
                 }
 
                 if let Ok((piece_index, _)) = pieces_rx.try_recv() {
-                    let peer_has_piece =
-                        peer_pieces.lock().await.get(piece_index as usize).as_deref() == Some(&true);
+                    let peer_has_piece = peer_pieces
+                        .lock()
+                        .await
+                        .get(piece_index as usize)
+                        .as_deref()
+                        == Some(&true);
 
                     // A peer is extremely unlikely to want to download a piece
                     // they already have, so supressing HAVE messages in that
@@ -444,7 +458,12 @@ where
 
                 // TODO: keep track of if a request has been unfulfilled for too long
                 if !am_choked.load(Acquire) {
-                    for BlockWork { block_meta, requested, .. } in block_queue_read.iter() {
+                    for BlockWork {
+                        block_meta,
+                        requested,
+                        ..
+                    } in block_queue_read.iter()
+                    {
                         if !requested.load(Acquire) {
                             log::debug!("[{}]: Requesting {:?}", peer_num, block_meta);
 
@@ -483,7 +502,7 @@ enum PeerConnectionError<R: error::Error + 'static, W: error::Error + 'static> {
     },
     #[snafu(display("Could not send downloaded block through channel: {}", source))]
     BlockSendError {
-        source: tokio::sync::mpsc::error::SendError<Block>,
+        source: mpsc::error::SendError<Block>,
     },
     #[snafu(display("Peer sent message with an invalid piece index"))]
     InvalidPieceIndex,
@@ -525,7 +544,7 @@ fn get_available_blocks(
 }
 
 struct BlockWork {
-    block_meta: tokio::sync::OwnedMutexGuard<BlockMeta>,
+    block_meta: OwnedMutexGuard<BlockMeta>,
     requested: AtomicBool,
     piece_available_blocks: Arc<AtomicU32>,
 }
@@ -552,7 +571,7 @@ impl Borrow<u32> for PieceKey {
 
 #[derive(Debug)]
 struct PieceWorkInfo {
-    blocks: Vec<Arc<tokio::sync::Mutex<BlockMeta>>>,
+    blocks: Vec<Arc<Mutex<BlockMeta>>>,
     available_blocks: Arc<AtomicU32>,
 }
 
@@ -572,9 +591,7 @@ fn construct_worker_queue(torrent: &Torrent, block_len: u32) -> WorkerQueue {
             let num_blocks = (left_piece_len as f64 / block_len as f64).ceil() as u32;
 
             (
-                PieceKey {
-                    piece_index,
-                },
+                PieceKey { piece_index },
                 PieceWorkInfo {
                     available_blocks: Arc::new(AtomicU32::new(num_blocks)),
                     blocks: (0..num_blocks)
@@ -582,7 +599,7 @@ fn construct_worker_queue(torrent: &Torrent, block_len: u32) -> WorkerQueue {
                             let this_block_len = cmp::min(left_piece_len, block_len as u64) as u32;
                             left_piece_len = left_piece_len.saturating_sub(block_len as u64);
 
-                            Arc::new(tokio::sync::Mutex::new(BlockMeta {
+                            Arc::new(Mutex::new(BlockMeta {
                                 piece_index,
                                 begin: block_index * block_len,
                                 length: this_block_len,
