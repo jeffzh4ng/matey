@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use is_macro::Is;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take, take_while1},
@@ -21,46 +22,12 @@ pub fn parse_bencode(bencode: &[u8]) -> IResult<&[u8], Bencode> {
     ))(bencode)
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Is)]
 pub enum Bencode {
     Number(i64),
     ByteString(Bytes),
     List(Vec<Bencode>),
     Dict(BTreeMap<Bytes, Bencode>),
-}
-
-impl Bencode {
-    pub fn number(self) -> Option<i64> {
-        if let Self::Number(num) = self {
-            Some(num)
-        } else {
-            None
-        }
-    }
-
-    pub fn byte_string(self) -> Option<Bytes> {
-        if let Self::ByteString(bytes) = self {
-            Some(bytes)
-        } else {
-            None
-        }
-    }
-
-    pub fn list(self) -> Option<Vec<Bencode>> {
-        if let Self::List(list) = self {
-            Some(list)
-        } else {
-            None
-        }
-    }
-
-    pub fn dict(self) -> Option<BTreeMap<Bytes, Bencode>> {
-        if let Self::Dict(dict) = self {
-            Some(dict)
-        } else {
-            None
-        }
-    }
 }
 
 #[non_exhaustive]
