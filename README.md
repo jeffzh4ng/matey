@@ -4,6 +4,12 @@
 
 A BitTorrent client written in Rust.
 
+## Usage
+
+`cargo run <filename>`
+
+![](https://i.imgur.com/WlyutF1.gif)
+
 ## Goals
 
 - User-friendliness
