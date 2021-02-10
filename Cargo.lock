@@ -531,6 +531,7 @@ dependencies = [
  "log",
  "nom",
  "percent-encoding",
+ "pin-project-lite",
  "rand",
  "reqwest",
  "sha-1",

@@ -13,12 +13,14 @@ use rand::{distributions::Bernoulli, prelude::*};
 use sha1::{Digest, Sha1};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
+    task::{Context, Poll, ready},
+    pin::Pin,
     borrow::{Borrow, Cow},
     cmp,
     collections::BTreeMap,
     convert::{TryFrom, TryInto},
     env, error,
-    io::SeekFrom,
+    io::{self, SeekFrom},
     mem,
     path::Path,
     sync::{
@@ -30,7 +32,7 @@ use std::{
 use tcp_peer_communicator::create_tcp_peer_rw;
 use tokio::{
     self,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf},
     net::TcpStream,
     sync::{broadcast, mpsc, Mutex, OwnedMutexGuard, RwLock},
     task, time,
@@ -38,6 +40,7 @@ use tokio::{
 use torrent_parser::{SHA1Hash, Torrent};
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
+use pin_project_lite::pin_project;
 
 const PORT: u16 = 6881;
 const KIB: u32 = 1024;
@@ -252,6 +255,102 @@ async fn store_blocks(
     }
 
     Ok(())
+}
+
+pin_project! {
+    #[derive(Debug)]
+    struct FixedLengthChain<F, S> {
+        #[pin]
+        first: F,
+        #[pin]
+        second: S,
+        first_cursor: usize,
+        first_total: usize,
+    }
+}
+
+impl<F, S> FixedLengthChain<F, S> {
+    fn new(first: F, second: S, first_total: usize) -> Self {
+        Self {
+            first,
+            second,
+            first_cursor: 0,
+            first_total
+        }
+    }
+}
+
+impl<F: AsyncRead, S: AsyncRead> AsyncRead for FixedLengthChain<F, S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
+        let me = self.project();
+
+        if me.first_cursor < me.first_total {
+            let rem = buf.remaining();
+            let max_new_bytes = me.first_total.saturating_sub(*me.first_cursor);
+
+            ready!(me.first.poll_read(cx, buf))?;
+
+            let new_bytes = rem.saturating_sub(buf.remaining());
+
+            if new_bytes > max_new_bytes {
+                buf.set_filled(buf.filled().len() - (new_bytes - max_new_bytes));
+            }
+
+            *me.first_cursor += new_bytes;
+
+            if me.first_cursor < me.first_total {
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        me.second.poll_read(cx, buf)
+    }
+}
+
+impl<F: AsyncWrite, S: AsyncWrite> AsyncWrite for FixedLengthChain<F, S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let me = self.project();
+
+        let remaining_bytes = me.first_total.saturating_sub(*me.first_cursor);
+
+        let (first_buf, second_buf) = buf.split_at(cmp::min(remaining_bytes, buf.len()));
+
+        let mut written = 0;
+
+        if !first_buf.is_empty() {
+            written += ready!(me.first.poll_write(cx, first_buf))?;
+        }
+
+        if !second_buf.is_empty() {
+            written += ready!(me.second.poll_write(cx, second_buf))?;
+        }
+
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        let me = self.project();
+
+        ready!(me.first.poll_flush(cx))?;
+        me.second.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        let me = self.project();
+
+        ready!(me.first.poll_shutdown(cx))?;
+        me.second.poll_shutdown(cx)
+    }
+}
+
+impl<F: AsyncSeek, S: AsyncSeek> AsyncSeek for FixedLengthChain<F, S> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        todo!()
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<u64>> {
+        todo!()
+    }
 }
 
 async fn peer_connection<R: PeerReader, W: PeerWriter>(
