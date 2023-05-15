@@ -1,4 +1,4 @@
-#![feature(slice_as_chunks, with_options)]
+#![feature(slice_as_chunks)]
 
 mod bencode_parser;
 mod tcp_peer_communicator;
@@ -9,12 +9,11 @@ mod types;
 use bitvec::prelude::*;
 use bytes::BytesMut;
 use indicatif::{ProgressBar, ProgressStyle};
+use pin_project_lite::pin_project;
 use rand::{distributions::Bernoulli, prelude::*};
 use sha1::{Digest, Sha1};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
-    task::{Context, Poll, ready},
-    pin::Pin,
     borrow::{Borrow, Cow},
     cmp,
     collections::BTreeMap,
@@ -23,16 +22,18 @@ use std::{
     io::{self, SeekFrom},
     mem,
     path::Path,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering::*},
         Arc,
     },
+    task::{ready, Context, Poll},
     time::Duration,
 };
 use tcp_peer_communicator::create_tcp_peer_rw;
 use tokio::{
     self,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     sync::{broadcast, mpsc, Mutex, OwnedMutexGuard, RwLock},
     task, time,
@@ -40,7 +41,6 @@ use tokio::{
 use torrent_parser::{SHA1Hash, Torrent};
 use tracker::{build_peer_id, build_peerlist, build_tracker_url};
 use types::{Block, BlockMeta, Message, PeerReader, PeerWriter};
-use pin_project_lite::pin_project;
 
 const PORT: u16 = 6881;
 const KIB: u32 = 1024;
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             // Using tokio's File::create directly here would be annoying
             // because we'd have to deal with the iterator's Items being Futures
             // instead of actual File values.
-            let file_handle = std::fs::File::with_options()
+            let file_handle = std::fs::File::options()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -275,13 +275,17 @@ impl<F, S> FixedLengthChain<F, S> {
             first,
             second,
             first_cursor: 0,
-            first_total
+            first_total,
         }
     }
 }
 
 impl<F: AsyncRead, S: AsyncRead> AsyncRead for FixedLengthChain<F, S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut ReadBuf,
+    ) -> Poll<io::Result<()>> {
         let me = self.project();
 
         if me.first_cursor < me.first_total {
